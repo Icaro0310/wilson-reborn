@@ -286,6 +286,9 @@ fn main() {
         builder.with_fullscreen(Some(Fullscreen::Borderless(None)))
     };
     let window = Rc::new(builder.build(&event_loop).expect("failed to create window"));
+    if is_preview {
+        install_rim_passthrough(&window);
+    }
     if cfg.debug {
         let s = window.inner_size();
         let mode = if is_preview {
@@ -337,8 +340,23 @@ fn main() {
                     }
                     WindowEvent::CursorMoved { position, .. } if is_preview => {
                         cursor_pos = (position.x, position.y);
-                        if let (Some(p), Some(d)) = (preview_parent, planet_drag) {
-                            planet_drag_move(p, d);
+                        if let (Some(p), Some(g)) = (preview_parent, planet_drag) {
+                            if left_button_down() {
+                                planet_grab_apply(p, g);
+                            } else {
+                                // The button-up never reached us — a context menu
+                                // or the modal resize loop stole our capture.
+                                // Drop the stale drag instead of letting the
+                                // planet chase the cursor with no button held.
+                                planet_drag = None;
+                            }
+                        }
+                    }
+                    // Focus loss (menu popup, Alt+Tab, desktop switch) also
+                    // interrupts the press/release pair — end the drag.
+                    WindowEvent::Focused(false) if is_preview => {
+                        if planet_drag.is_some() {
+                            planet_drag = None;
                         }
                     }
                     // Living Island host integration: in the embedded preview the
@@ -370,10 +388,7 @@ fn main() {
                             && button == winit::event::MouseButton::Left
                             && state == ElementState::Released =>
                     {
-                        if planet_drag.is_some() {
-                            planet_drag = None;
-                            planet_drag_end();
-                        }
+                        planet_drag = None;
                     }
                     WindowEvent::MouseInput { button, state, .. } if !is_preview => {
                         if cfg.debug {
@@ -753,30 +768,39 @@ fn notify_preview_parent(parent: Option<isize>, window: &winit::window::Window) 
     }
 }
 
-/// Offset of the cursor inside the host window while the user drags the planet
-/// by its inside — the window follows the mouse with no drift (Living Island).
+/// What a left press grabbed on the planet while embedded (Living Island).
+/// Move drags the host by the cursor offset; Resize stretches the grabbed
+/// rim edge/corner, always keeping the window square like the host's
+/// `WM_SIZING` clamp intends.
 #[cfg(windows)]
-#[derive(Clone, Copy)]
-struct PlanetDrag {
-    dx: i32,
-    dy: i32,
+#[derive(Clone, Copy, Debug)]
+enum PlanetGrab {
+    Move {
+        dx: i32,
+        dy: i32,
+    },
+    Resize {
+        ht: isize,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    },
 }
 
-/// Living Island host integration: a left press in the embedded preview drags the
-/// planet. In the rim band we post the matching `HT*` code to the parent as a
-/// `WM_NCLBUTTONDOWN` — DefWindowProc then runs the system resize loop (the WPF
-/// host clamps `WM_SIZING` to a circle). Elsewhere the host's posted-HTCAPTION
-/// move loop does nothing, so instead we capture the mouse and return the grab
-/// offset for [`planet_drag_move`] to apply with `SetWindowPos`. `None` without a
-/// parent or off Windows.
+/// Living Island host integration: a left press in the embedded preview grabs
+/// the planet. Rim presses never reach us — [`install_rim_passthrough`] makes
+/// them fall through to the host, which answers `WM_NCHITTEST` with real
+/// border codes so Windows runs the native sizing loop — so in practice this
+/// only ever produces a `Move` grab; the `Resize` arm stays as a fallback if
+/// the subclass was never installed. `None` without a parent or off Windows.
 #[cfg(windows)]
 fn drag_preview_parent(
     parent: isize,
     window: &winit::window::Window,
     x: f64,
     y: f64,
-) -> Option<PlanetDrag> {
-    const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+) -> Option<PlanetGrab> {
     const HTLEFT: isize = 10;
     const HTRIGHT: isize = 11;
     const HTTOP: isize = 12;
@@ -799,12 +823,9 @@ fn drag_preview_parent(
     }
     #[link(name = "user32")]
     extern "system" {
-        fn PostMessageW(hwnd: isize, msg: u32, wparam: isize, lparam: isize) -> i32;
         fn GetCursorPos(pt: *mut Point) -> i32;
         fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
-        fn SetCapture(hwnd: isize) -> isize;
     }
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let size = window.inner_size();
     let (w, h) = (f64::from(size.width), f64::from(size.height));
     if w <= 0.0 || h <= 0.0 {
@@ -825,48 +846,52 @@ fn drag_preview_parent(
         _ => 0,
     };
     let mut pt = Point { x: 0, y: 0 };
-    // SAFETY: `parent` is the host HWND passed via /p; posting a message carries
-    // no lifetime risk, and the pointers are valid out-params.
-    unsafe {
-        GetCursorPos(&mut pt);
-        if ht != 0 {
-            let lparam = (((pt.y as i64) & 0xFFFF) << 16) | ((pt.x as i64) & 0xFFFF);
-            PostMessageW(parent, WM_NCLBUTTONDOWN, ht, lparam as isize);
-            return None;
-        }
-    }
-    // Inside the planet: manual drag. Capture the mouse on our own window so the
-    // move keeps tracking even if the cursor briefly leaves the disk, and record
-    // the grab offset between cursor and host origin.
     let mut rect = Rect {
         left: 0,
         top: 0,
         right: 0,
         bottom: 0,
     };
-    let our_hwnd = match window.window_handle() {
-        Ok(handle) => match handle.as_raw() {
-            RawWindowHandle::Win32(w) => w.hwnd.get(),
-            _ => return None,
-        },
-        Err(_) => return None,
-    };
-    // SAFETY: `parent` is the live host HWND; `our_hwnd` is our live window.
+    // SAFETY: `parent` is the live host HWND and the pointers are valid
+    // out-params. No explicit SetCapture here: winit already captures the mouse
+    // on WM_LBUTTONDOWN and releases on WM_LBUTTONUP — a second capture desyncs
+    // its internal capture_count when a popup or modal loop steals the mouse.
     unsafe {
+        GetCursorPos(&mut pt);
         if GetWindowRect(parent, &mut rect) == 0 {
             return None;
         }
-        SetCapture(our_hwnd);
     }
-    Some(PlanetDrag {
-        dx: pt.x - rect.left,
-        dy: pt.y - rect.top,
-    })
+    if ht != 0 {
+        Some(PlanetGrab::Resize {
+            ht,
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        })
+    } else {
+        Some(PlanetGrab::Move {
+            dx: pt.x - rect.left,
+            dy: pt.y - rect.top,
+        })
+    }
 }
 
-/// Move the host window so the cursor keeps its grab offset (Living Island drag).
+/// Apply one cursor step of the active planet grab to the host window
+/// (Living Island): `Move` keeps the grab offset, `Resize` pulls the grabbed
+/// edge/corner to the cursor and re-squares the window around the fixed side.
 #[cfg(windows)]
-fn planet_drag_move(parent: isize, drag: PlanetDrag) {
+fn planet_grab_apply(parent: isize, grab: PlanetGrab) {
+    const HTLEFT: isize = 10;
+    const HTRIGHT: isize = 11;
+    const HTTOP: isize = 12;
+    const HTTOPLEFT: isize = 13;
+    const HTTOPRIGHT: isize = 14;
+    const HTBOTTOM: isize = 15;
+    const HTBOTTOMLEFT: isize = 16;
+    const HTBOTTOMRIGHT: isize = 17;
+    const MIN_SIDE: i32 = 120;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOZORDER: u32 = 0x0004;
     const SWP_NOACTIVATE: u32 = 0x0010;
@@ -889,34 +914,246 @@ fn planet_drag_move(parent: isize, drag: PlanetDrag) {
         ) -> i32;
     }
     let mut pt = Point { x: 0, y: 0 };
-    // SAFETY: `parent` is the host HWND passed via /p; `pt` is a valid out-pointer.
+    // SAFETY: `parent` is the live host HWND; `pt` is a valid out-pointer.
     unsafe {
         GetCursorPos(&mut pt);
-        SetWindowPos(
-            parent,
-            0,
-            pt.x - drag.dx,
-            pt.y - drag.dy,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
+        match grab {
+            PlanetGrab::Move { dx, dy } => SetWindowPos(
+                parent,
+                0,
+                pt.x - dx,
+                pt.y - dy,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            ),
+            PlanetGrab::Resize {
+                ht,
+                left,
+                top,
+                right,
+                bottom,
+            } => {
+                let (mut l, mut t, mut r, mut b) = (left, top, right, bottom);
+                // Side = the dragged dimension; the square grows/shrinks from
+                // the fixed opposite edge or corner (edge drags stay centered
+                // on the untouched axis).
+                let side = match ht {
+                    HTLEFT => (right - pt.x).max(MIN_SIDE),
+                    HTRIGHT => (pt.x - left).max(MIN_SIDE),
+                    HTTOP => (bottom - pt.y).max(MIN_SIDE),
+                    HTBOTTOM => (pt.y - top).max(MIN_SIDE),
+                    HTTOPLEFT => (right - pt.x).max(bottom - pt.y).max(MIN_SIDE),
+                    HTTOPRIGHT => (pt.x - left).max(bottom - pt.y).max(MIN_SIDE),
+                    HTBOTTOMLEFT => (right - pt.x).max(pt.y - top).max(MIN_SIDE),
+                    _ => (pt.x - left).max(pt.y - top).max(MIN_SIDE),
+                };
+                match ht {
+                    HTLEFT => l = right - side,
+                    HTRIGHT => r = left + side,
+                    HTTOP => t = bottom - side,
+                    HTBOTTOM => b = top + side,
+                    HTTOPLEFT => {
+                        l = right - side;
+                        t = bottom - side;
+                    }
+                    HTTOPRIGHT => {
+                        r = left + side;
+                        t = bottom - side;
+                    }
+                    HTBOTTOMLEFT => {
+                        l = right - side;
+                        b = top + side;
+                    }
+                    HTBOTTOMRIGHT => {
+                        r = left + side;
+                        b = top + side;
+                    }
+                    _ => {}
+                }
+                // Edge drags keep the perpendicular axis centered on the
+                // original window, mirroring the host's WM_SIZING clamp.
+                match ht {
+                    HTLEFT | HTRIGHT => {
+                        let cy = (top + bottom) / 2;
+                        t = cy - side / 2;
+                        b = t + side;
+                    }
+                    HTTOP | HTBOTTOM => {
+                        let cx = (left + right) / 2;
+                        l = cx - side / 2;
+                        r = l + side;
+                    }
+                    _ => {}
+                }
+                SetWindowPos(parent, 0, l, t, r - l, b - t, SWP_NOZORDER | SWP_NOACTIVATE)
+            }
+        };
     }
 }
 
-/// End the manual planet drag (Living Island): release our mouse capture.
+/// Whether the left mouse button is physically held right now (Living Island).
+/// The `Released` event can be lost when the modal resize loop or a context
+/// menu steals our capture, so `CursorMoved` double-checks the real state.
 #[cfg(windows)]
-fn planet_drag_end() {
+fn left_button_down() -> bool {
+    const VK_LBUTTON: i32 = 0x01;
     #[link(name = "user32")]
     extern "system" {
-        fn ReleaseCapture() -> i32;
+        fn GetAsyncKeyState(key: i32) -> i16;
     }
-    // SAFETY: releasing capture we took in `drag_preview_parent`; harmless if the
-    // modal resize loop already stole it.
-    unsafe {
-        ReleaseCapture();
+    // SAFETY: a plain state query on a virtual key; no lifetime or memory risk.
+    unsafe { (GetAsyncKeyState(VK_LBUTTON) as u16) & 0x8000 != 0 }
+}
+
+/// Previous window proc of the embedded child, chained to by [`rim_passthrough`].
+#[cfg(windows)]
+static PREV_CHILD_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Subclassed wndproc for the embedded preview child (Living Island). It
+/// intercepts two messages so the planet's rim resizes the *host* window with
+/// the real native sizing loop:
+///
+/// * `WM_NCHITTEST` inside the rim band answers the actual border code
+///   (`HTLEFT`..`HTBOTTOMRIGHT`), so a rim press arrives as
+///   `WM_NCLBUTTONDOWN` here instead of a client click.
+/// * That `WM_NCLBUTTONDOWN` is forwarded to the host with `SendMessage`, and
+///   the host's hook calls `DefWindowProc` — which runs the modal sizing loop
+///   on the host's own thread, tracking the mouse and driving its `WM_SIZING`
+///   square clamp. `HTTRANSPARENT` cannot be used because hit-testing only
+///   falls through to windows on the *same* thread; the host lives in another
+///   process.
+///
+/// Everything else defers to winit's proc.
+#[cfg(windows)]
+unsafe extern "system" fn rim_passthrough(
+    hwnd: isize,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    const WM_NCHITTEST: u32 = 0x0084;
+    const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+    const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
+    const HTLEFT: isize = 10;
+    const HTRIGHT: isize = 11;
+    const HTTOP: isize = 12;
+    const HTTOPLEFT: isize = 13;
+    const HTTOPRIGHT: isize = 14;
+    const HTBOTTOM: isize = 15;
+    const HTBOTTOMLEFT: isize = 16;
+    const HTBOTTOMRIGHT: isize = 17;
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
+        fn GetParent(hwnd: isize) -> isize;
+        fn ScreenToClient(hwnd: isize, pt: *mut Point) -> i32;
+        fn SendMessageW(hwnd: isize, msg: u32, w: usize, l: isize) -> isize;
+        fn CallWindowProcW(proc: isize, hwnd: isize, msg: u32, w: usize, l: isize) -> isize;
+    }
+    if msg == WM_NCHITTEST {
+        // lParam packs the screen-space cursor point into signed 16-bit halves.
+        let mut pt = Point {
+            x: lparam as i16 as i32,
+            y: (lparam >> 16) as i16 as i32,
+        };
+        let mut rc = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: valid out-params; `hwnd` is our own live child window.
+        if unsafe { GetClientRect(hwnd, &mut rc) } != 0
+            && unsafe { ScreenToClient(hwnd, &mut pt) } != 0
+        {
+            let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+            let band = (f64::from(w.min(h)) * 0.09).clamp(10.0, 26.0) as i32;
+            let (x, y) = (pt.x - rc.left, pt.y - rc.top);
+            let (l, r) = (x < band, x >= w - band);
+            let (t, b) = (y < band, y >= h - band);
+            let ht = match (l, r, t, b) {
+                (true, _, true, _) => HTTOPLEFT,
+                (true, _, _, true) => HTBOTTOMLEFT,
+                (_, true, true, _) => HTTOPRIGHT,
+                (_, true, _, true) => HTBOTTOMRIGHT,
+                (true, ..) => HTLEFT,
+                (_, true, ..) => HTRIGHT,
+                (.., true, _) => HTTOP,
+                (.., true) => HTBOTTOM,
+                _ => 0,
+            };
+            if ht != 0 {
+                return ht;
+            }
+        }
+    }
+    if (msg == WM_NCLBUTTONDOWN || msg == WM_NCLBUTTONDBLCLK)
+        && (HTLEFT..=HTBOTTOMRIGHT).contains(&(wparam as isize))
+    {
+        // A rim press: hand it to the host so its DefWindowProc runs the real
+        // modal sizing loop (blocks until the drag ends).
+        let parent = unsafe { GetParent(hwnd) };
+        if parent != 0 {
+            // SAFETY: plain cross-process SendMessage; lParam already carries
+            // the screen-space point.
+            return unsafe { SendMessageW(parent, msg, wparam, lparam) };
+        }
+    }
+    let prev = PREV_CHILD_WNDPROC.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `prev` is the wndproc winit installed before our subclass;
+    // chaining to it preserves all other message handling.
+    unsafe { CallWindowProcW(prev, hwnd, msg, wparam, lparam) }
+}
+
+/// Install [`rim_passthrough`] on the embedded preview window (Living Island).
+#[cfg(windows)]
+fn install_rim_passthrough(window: &winit::window::Window) {
+    const GWLP_WNDPROC: i32 = -4;
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowLongPtrW(hwnd: isize, index: i32, new_proc: isize) -> isize;
+    }
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(w) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: called on the thread that owns the window; the returned value is
+    // winit's wndproc, which [`rim_passthrough`] chains to.
+    let prev = unsafe {
+        SetWindowLongPtrW(
+            w.hwnd.get(),
+            GWLP_WNDPROC,
+            rim_passthrough as *const () as usize as isize,
+        )
+    };
+    if prev != 0 {
+        PREV_CHILD_WNDPROC.store(prev, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
+#[cfg(not(windows))]
+fn left_button_down() -> bool {
+    true
+}
+
+#[cfg(not(windows))]
+fn install_rim_passthrough(_window: &winit::window::Window) {}
 
 #[cfg(not(windows))]
 fn drag_preview_parent(
@@ -929,10 +1166,7 @@ fn drag_preview_parent(
 }
 
 #[cfg(not(windows))]
-fn planet_drag_move(_parent: isize, _drag: ()) {}
-
-#[cfg(not(windows))]
-fn planet_drag_end() {}
+fn planet_grab_apply(_parent: isize, _grab: ()) {}
 
 #[cfg(not(windows))]
 fn notify_preview_parent(_parent: Option<isize>, _window: &winit::window::Window) {}
