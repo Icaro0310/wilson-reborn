@@ -50,7 +50,9 @@ pub use error::{EngineError, Result};
 pub use island::Island;
 pub use path::{calc_path, calc_paths, NUM_OF_NODES};
 pub use rng::Rng;
-pub use show::{Clock, DebugInfo, Frame, Show, DEFAULT_INTRO_TICKS};
+pub use show::{
+    Clock, DebugInfo, Frame, ObjectKind, SceneObject, SceneWorld, Show, DEFAULT_INTRO_TICKS,
+};
 pub use story::{
     DayNight, Director, Holiday, IslandState, ScenePlay, StoryRun, StoryScene, STORY_SCENES,
 };

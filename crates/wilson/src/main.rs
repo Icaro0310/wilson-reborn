@@ -30,6 +30,7 @@ mod embedded;
 mod font;
 mod pace;
 mod scale;
+mod spatial;
 mod state;
 mod stats;
 mod timectl;
@@ -91,6 +92,43 @@ fn main() {
     }
     cfg.apply_args(&args);
     let wide_angle = args.iter().any(|arg| arg == "--wide-angle");
+    // `--spatial` replaces the fisheye: the engine emits its un-flattened
+    // layers and a raised 2.5D camera composes them (diorama view). The old
+    // flag stays available for side-by-side comparison during development.
+    let spatial = args.iter().any(|arg| arg == "--spatial");
+    // Camera tuning flags (`--cam-*`): zoom/pan move the camera, never deform
+    // the world — used for A/B captures and spatial tuning.
+    let mut camera = spatial::SpatialCamera::default();
+    let arg_f32 = |flag: &str| -> Option<f32> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+    };
+    if let Some(v) = arg_f32("--cam-zoom") {
+        camera.zoom = v.max(0.05);
+    }
+    if let Some(v) = arg_f32("--cam-pan-x") {
+        camera.pan_x = v;
+    }
+    if let Some(v) = arg_f32("--cam-pan-y") {
+        camera.pan_y = v;
+    }
+    if let Some(v) = arg_f32("--cam-horizon") {
+        camera.horizon_v = v.clamp(0.02, 0.9);
+    }
+    if let Some(v) = arg_f32("--cam-seam") {
+        camera.seam_v = v.clamp(0.02, 0.95);
+    }
+    if let Some(v) = arg_f32("--cam-tilt") {
+        camera.tilt = v.clamp(1.0, 4.0);
+    }
+    if let Some(v) = arg_f32("--cam-far") {
+        camera.far_compression = v.max(0.05);
+    }
+    if let Some(v) = arg_f32("--cam-near") {
+        camera.near_expansion = v.max(0.05);
+    }
 
     // Windows screensaver verbs.
     let action = screensaver_action(&args);
@@ -171,10 +209,17 @@ fn main() {
         (d, real)
     };
     let director = director.with_daynight(cfg.daynight);
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let seed = args
+        .iter()
+        .position(|a| a == "--seed")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        });
     let mut show = Show::new(&archive, &palette, 640, 480, director, clock, seed);
     if cfg.intro {
         // the original's startup intro screen (INTRO.SCR), held for the configured seconds
@@ -185,6 +230,9 @@ fn main() {
     }
     if cfg.transition == config::Transition::Dissolve {
         show.enable_dissolve(); // the original's dormant LFSR tiled dissolve, opt-in
+    }
+    if spatial {
+        show.enable_layers(); // emit the un-flattened world/character planes
     }
 
     // Persist the story day whenever it advances, so the arc carries over to the next
@@ -205,6 +253,9 @@ fn main() {
     // stepping the animation. See `pace::FramePacer`.
     let mut pacer = pace::FramePacer::new();
     let mut last_rgba: Option<Vec<u8>> = None;
+    // The last layered frame's scene world, for repaint-without-step
+    // (resize/redraw) under `--spatial`.
+    let mut last_layers: Option<wilson_engine::SceneWorld> = None;
 
     // --debug diagnostics: measured FPS over a rolling 1-second window.
     let mut dbg_frames = 0u32;
@@ -395,26 +446,49 @@ fn main() {
                                     stats.save();
                                     last_flush = Instant::now();
                                 }
-                                let rgba = frame.surface.to_rgba(&palette);
-                                // Optional: smooth the dithered sea/sky before scaling.
-                                let rgba = if cfg.dedither {
-                                    wilson_engine::dedither(&rgba, 640, 480)
+                                // Spatial mode composes the un-flattened layers through
+                                // the camera; the flat RGBA is only needed otherwise.
+                                let layered = spatial && frame.layers.is_some();
+                                let rgba = if layered {
+                                    Vec::new()
                                 } else {
-                                    rgba
+                                    let rgba = frame.surface.to_rgba(&palette);
+                                    // Optional: smooth the dithered sea/sky before scaling.
+                                    if cfg.dedither {
+                                        wilson_engine::dedither(&rgba, 640, 480)
+                                    } else {
+                                        rgba
+                                    }
                                 };
                                 {
                                     let mut buffer = surface.buffer_mut().expect("surface buffer");
-                                    scale::scale_rgba_to_argb_desktop(
-                                        &rgba,
-                                        640,
-                                        480,
-                                        &mut buffer,
-                                        size.width as usize,
-                                        size.height as usize,
-                                        cfg.scale,
-                                        cfg.filter,
-                                        wide_angle,
-                                    );
+                                    if layered {
+                                        let layers = frame.layers.as_ref().unwrap();
+                                        spatial::render(
+                                            layers,
+                                            &palette,
+                                            &mut buffer,
+                                            size.width as usize,
+                                            size.height as usize,
+                                            &camera,
+                                            cfg.filter,
+                                            cfg.dedither,
+                                        );
+                                        last_layers = Some(layers.clone());
+                                    } else {
+                                        scale::scale_rgba_to_argb_desktop(
+                                            &rgba,
+                                            640,
+                                            480,
+                                            &mut buffer,
+                                            size.width as usize,
+                                            size.height as usize,
+                                            cfg.scale,
+                                            cfg.filter,
+                                            wide_angle,
+                                        );
+                                        last_layers = None;
+                                    }
                                     if cfg.debug {
                                         // Measure FPS over a 1s window; emit a stdout status
                                         // line each second and draw the on-screen HUD.
@@ -471,14 +545,27 @@ fn main() {
                                 // in the past and the next frame runs immediately.
                                 let due = pacer.schedule(frame_start, delay);
                                 elwt.set_control_flow(ControlFlow::WaitUntil(due));
-                                last_rgba = Some(rgba);
+                                last_rgba = if layered { None } else { Some(rgba) };
                             } else {
                                 // A redraw arrived before the current frame's hold elapsed
                                 // (the OS startup burst, a resize, a scale change). Re-present
                                 // the last frame at the current size so resizes still repaint —
                                 // but do NOT step the animation, or the intro/first frames flash
                                 // by. Re-arm the existing deadline without moving it.
-                                if let Some(rgba) = &last_rgba {
+                                if let Some(world) = &last_layers {
+                                    let mut buffer = surface.buffer_mut().expect("surface buffer");
+                                    spatial::render(
+                                        world,
+                                        &palette,
+                                        &mut buffer,
+                                        size.width as usize,
+                                        size.height as usize,
+                                        &camera,
+                                        cfg.filter,
+                                        cfg.dedither,
+                                    );
+                                    buffer.present().expect("present");
+                                } else if let Some(rgba) = &last_rgba {
                                     let mut buffer = surface.buffer_mut().expect("surface buffer");
                                     scale::scale_rgba_to_argb_desktop(
                                         rgba,
@@ -965,6 +1052,10 @@ fn print_help() {
     println!("  --scale <MODE>                   fit | stretch | integer | extend (default: fit)");
     println!("                                     extend = fill widescreen, no bars/distortion");
     println!("  --wide-angle                     fisheye 'little planet' lens (scene in a disk)");
+    println!("  --spatial                        2.5D diorama: raised camera + upright sprites");
+    println!("                                     camera: --cam-zoom --cam-pan-x --cam-pan-y");
+    println!("                                     --cam-horizon --cam-seam --cam-tilt");
+    println!("                                     --cam-far --cam-near <FLOAT>");
     println!("  --filter <nearest|linear|xbr|xbrz> pixel sampling (default: linear):");
     println!("                                     nearest = crisp/retro,");
     println!("                                     linear  = smooth (bilinear, default),");

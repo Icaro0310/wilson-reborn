@@ -27,6 +27,10 @@ pub struct AdsFrame {
     /// The composited indexed-color image for this frame.
     pub surface: Surface,
     pub(crate) foreground: Surface,
+    /// The character-plane parts (saved zones + each running thread's layer),
+    /// snapshotted at the same instant as `foreground` — before the timer
+    /// post-processing mutates the thread layers.
+    pub(crate) parts: Vec<Surface>,
     /// How long to display the frame, in engine ticks (1 tick = [`crate::MS_PER_TICK`] = 16 ms).
     pub delay_ticks: u16,
     /// Sound effect ids triggered during this frame.
@@ -159,6 +163,27 @@ impl AdsVm {
             .compose_over(foreground)
     }
 
+    /// The world plane alone: static background + animated wave layer, before
+    /// the character foreground — the "ground" a spatial compositor projects.
+    pub(crate) fn compose_ground(&self) -> Surface {
+        self.background.compose_over(&self.background_animation)
+    }
+
+    /// The character-plane parts in composite order: saved zones, then each
+    /// running thread's layer. Composing them in sequence over the ground
+    /// reproduces [`compose_frame`] exactly — a spatial compositor uses them as
+    /// separate scene objects instead of the merged [`foreground`].
+    pub(crate) fn foreground_parts(&self) -> Vec<&Surface> {
+        let mut parts = vec![&self.saved_zones];
+        parts.extend(
+            self.threads
+                .iter()
+                .filter(|t| t.running != 0)
+                .map(|t| &t.layer),
+        );
+        parts
+    }
+
     fn foreground(&self) -> Surface {
         let mut foreground = self.saved_zones.clone();
         for thread in &self.threads {
@@ -219,6 +244,11 @@ impl AdsVm {
         //    (same order as jc_reborn's grUpdateDisplay).
         let foreground = self.foreground();
         let surface = self.compose_frame(&foreground);
+        let parts = self
+            .foreground_parts()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
 
         // 3. Shortest pending delay across active threads.
         let mut mini = 300u16;
@@ -270,6 +300,7 @@ impl AdsVm {
         Ok(Some(AdsFrame {
             surface,
             foreground,
+            parts,
             delay_ticks: mini,
             sounds,
         }))

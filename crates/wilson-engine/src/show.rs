@@ -41,7 +41,7 @@ pub struct Clock {
 }
 
 /// A composited frame to display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
     /// The composited indexed-color image.
     pub surface: Surface,
@@ -49,6 +49,81 @@ pub struct Frame {
     pub delay_ticks: u16,
     /// Sound effect ids triggered this frame.
     pub sounds: Vec<u16>,
+    /// Un-flattened scene world, present only on scene frames emitted after
+    /// [`Show::enable_layers`] (a spatial compositor needs the objects separate).
+    /// `None` on the flat path and on transitional frames (intro, dissolve).
+    pub layers: Option<SceneWorld>,
+}
+
+/// What a scene object is, semantically. `Johnny` is only set when the runtime
+/// *knows* it is drawing Johnny (the walk path's `JOHNWALK.BMP` sprite); ADS
+/// activity content stays `Activity` — the original data carries no actor tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// Johnny himself, walking (identity certain — the runtime placed him).
+    Johnny,
+    /// Island furniture redrawn to occlude Johnny (the palm trunk/leaves when he
+    /// walks behind the tree).
+    Occluder,
+    /// ADS activity content — one object per TTM thread layer (plus saved zones).
+    Activity,
+    /// Holiday props composited last (always above the rest).
+    HolidayProp,
+}
+
+/// A sprite standing on the world plane. `position` is the anchor point in
+/// normalized scene coordinates (0..1); `depth` orders objects spatially
+/// (scene-ground depth at the anchor: 0 = far/horizon, 1 = near/bottom);
+/// `order` is the original flat composite order — the exact draw order when
+/// depths tie and the fallback ordering the flat surface used.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneObject {
+    pub kind: ObjectKind,
+    /// The object's own pixels on a scene-sized surface ([`TRANSPARENT`] holes).
+    pub surface: Surface,
+    /// Anchor (feet/bottom-centre of the opaque pixels) in normalized scene coords.
+    pub position: (f32, f32),
+    /// Spatial depth — normalized ground depth of the anchor (may exceed 0..1
+    /// for sky-anchored objects, which a compositor keeps on the backdrop).
+    pub depth: f32,
+    /// Original composite order (paint index) — flat parity + tiebreak.
+    pub order: u32,
+}
+
+/// The separated world of a scene frame: an opaque ground plane plus spatially
+/// ordered objects. `Frame::surface` stays the authoritative flat composite —
+/// `ground` ∘ each object in `order` reproduces it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneWorld {
+    /// The world plane: sky, sea, island and the animated wave layer, composited.
+    pub ground: Surface,
+    /// Objects standing on/over the world plane, in original composite order.
+    pub objects: Vec<SceneObject>,
+}
+
+/// Anchor (centre-x of the widest bottom row, bottom row) and ground depth of a
+/// sprite plane, in normalized scene coordinates. `None` when fully transparent.
+fn sprite_anchor(surface: &Surface) -> Option<((f32, f32), f32)> {
+    let w = usize::from(surface.width);
+    let (mut min_x, mut max_x, mut max_y) = (usize::MAX, 0usize, 0usize);
+    let mut found = false;
+    for (i, &p) in surface.pixels.iter().enumerate() {
+        if p == crate::surface::TRANSPARENT {
+            continue;
+        }
+        found = true;
+        let (x, y) = (i % w, i / w);
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    found.then(|| {
+        let pos = (
+            (min_x + max_x) as f32 * 0.5 / w as f32,
+            max_y as f32 / surface.height as f32,
+        );
+        (pos, pos.1) // depth = normalized anchor row (0 far → 1 near)
+    })
 }
 
 #[derive(Debug)]
@@ -120,8 +195,13 @@ pub struct Show {
     pending_walk: Option<WalkFrame>,
     walk_ticks_left: u16,
     pending_ads_foreground: Option<Surface>,
+    /// The per-part character planes snapshotted with `pending_ads_foreground`
+    /// (threads keep animating between wave-boundary re-emits — never re-read live).
+    pending_ads_parts: Vec<Surface>,
     ads_ticks_left: u16,
     pending_ads_sounds: Vec<u16>,
+    /// When set, scene frames also carry their un-flattened [`SceneLayers`].
+    emit_layers: bool,
 }
 
 impl Show {
@@ -177,8 +257,10 @@ impl Show {
             pending_walk: None,
             walk_ticks_left: 0,
             pending_ads_foreground: None,
+            pending_ads_parts: Vec::new(),
             ads_ticks_left: 0,
             pending_ads_sounds: Vec::new(),
+            emit_layers: false,
         };
         show.plan_new_run(archive);
         show.run_boundary = false; // the very first run is not a transition
@@ -194,6 +276,14 @@ impl Show {
     /// Update the wall-clock inputs (call before a new run picks up a new day).
     pub fn set_clock(&mut self, clock: Clock) {
         self.clock = clock;
+    }
+
+    /// Emit [`Frame::layers`] on scene frames: the world plane (background +
+    /// animated waves) and the character plane (Johnny/activity sprites) kept
+    /// separate for a spatial (2.5D) compositor. `Frame::surface` is unchanged
+    /// and remains the flat composite — this only *adds* the split planes.
+    pub fn enable_layers(&mut self) {
+        self.emit_layers = true;
     }
 
     /// Queue the original's intro screen (`INTRO.SCR`) to be shown once at startup —
@@ -312,12 +402,14 @@ impl Show {
                 surface,
                 delay_ticks: 1,
                 sounds: Vec::new(),
+                layers: None,
             });
         }
         Frame {
             surface: self.dissolve.as_ref().unwrap().image().clone(),
             delay_ticks: 1,
             sounds: Vec::new(),
+            layers: None,
         }
     }
 
@@ -329,6 +421,7 @@ impl Show {
                 surface,
                 delay_ticks: self.intro_ticks,
                 sounds: Vec::new(),
+                layers: None,
             };
         }
         for _ in 0..20_000 {
@@ -381,6 +474,7 @@ impl Show {
                         sounds.insert(0, s);
                     }
                     self.pending_ads_foreground = Some(frame.foreground);
+                    self.pending_ads_parts = frame.parts;
                     self.ads_ticks_left = frame.delay_ticks.max(1);
                     self.pending_ads_sounds = sounds;
                     return self.emit_pending_ads();
@@ -394,6 +488,7 @@ impl Show {
             surface: Surface::new(self.width, self.height, 0),
             delay_ticks: 8,
             sounds: Vec::new(),
+            layers: None,
         }
     }
 
@@ -446,26 +541,134 @@ impl Show {
             .pending_ads_foreground
             .as_ref()
             .expect("pending ADS foreground");
-        let surface = match &self.stage {
-            Stage::Play(vm) => vm.compose_frame(foreground),
-            _ => Surface::new(self.width, self.height, 0),
+        let (surface, layers) = match &self.stage {
+            Stage::Play(vm) if self.emit_layers => {
+                let ground = vm.compose_ground();
+                // Each character-plane part becomes a scene object: saved zones,
+                // then each running TTM thread's layer, in original compose order.
+                // Per-part granularity keeps sprites spatially separable without
+                // relying on connected-component guesses in the compositor.
+                let mut objects: Vec<SceneObject> = Vec::new();
+                // Iterate the parts snapshotted with this frame (threads keep
+                // animating between wave-boundary re-emits — never re-read live).
+                for part in &self.pending_ads_parts {
+                    if let Some((position, depth)) = sprite_anchor(part) {
+                        objects.push(SceneObject {
+                            kind: ObjectKind::Activity,
+                            surface: part.clone(),
+                            position,
+                            depth,
+                            order: objects.len() as u32,
+                        });
+                    }
+                }
+                // Holiday props composite last → topmost object.
+                if let Some(hl) = self.island.as_ref().and_then(Island::holiday_layer) {
+                    if let Some((position, depth)) = sprite_anchor(hl) {
+                        objects.push(SceneObject {
+                            kind: ObjectKind::HolidayProp,
+                            surface: hl.clone(),
+                            position,
+                            depth,
+                            order: objects.len() as u32,
+                        });
+                    }
+                }
+                let surface = objects
+                    .iter()
+                    .fold(ground.clone(), |acc, o| acc.compose_over(&o.surface));
+                (surface, Some(SceneWorld { ground, objects }))
+            }
+            Stage::Play(vm) => (self.overlay_holiday(vm.compose_frame(foreground)), None),
+            _ => (Surface::new(self.width, self.height, 0), None),
         };
-        let surface = self.overlay_holiday(surface);
         let sounds = std::mem::take(&mut self.pending_ads_sounds);
         self.ads_ticks_left = self.ads_ticks_left.saturating_sub(delay);
         self.consume_wave_ticks(delay);
         if self.ads_ticks_left == 0 {
             self.pending_ads_foreground = None;
+            self.pending_ads_parts.clear();
         }
         Frame {
             surface,
             delay_ticks: delay,
             sounds,
+            layers,
         }
     }
 
     fn frame_from_walk(&self, wf: WalkFrame) -> Frame {
         let (dx, dy) = self.island.as_ref().map_or((0, 0), Island::offset);
+        if self.emit_layers {
+            // Johnny is a known entity here — the runtime placed the JOHNWALK
+            // sprite, so its anchor (feet) is exact, not inferred from pixels.
+            let ground = match &self.island {
+                Some(isl) => isl.background().clone(),
+                None => Surface::new(self.width, self.height, 0),
+            };
+            let mut objects: Vec<SceneObject> = Vec::new();
+            if let Some(img) = self.johnwalk.get(wf.sprite as usize) {
+                let mut surface = Surface::new(self.width, self.height, TRANSPARENT);
+                surface.blit(
+                    img.width,
+                    img.height,
+                    &img.pixels,
+                    wf.x + dx,
+                    wf.y + dy,
+                    Some(TRANSPARENT),
+                    wf.flip,
+                    None,
+                );
+                let position = (
+                    (wf.x + dx + i32::from(img.width) / 2) as f32 / self.width as f32,
+                    (wf.y + dy + i32::from(img.height)) as f32 / self.height as f32,
+                );
+                objects.push(SceneObject {
+                    kind: ObjectKind::Johnny,
+                    surface,
+                    position,
+                    depth: position.1,
+                    order: 0,
+                });
+            }
+            // The palm redrawn over Johnny occludes him — a foreground prop
+            // ordered after the character (drawn only when he walks behind it).
+            if wf.behind_tree {
+                if let Some(isl) = &self.island {
+                    let mut occ = Surface::new(self.width, self.height, TRANSPARENT);
+                    isl.redraw_tree(&mut occ);
+                    if let Some((position, depth)) = sprite_anchor(&occ) {
+                        objects.push(SceneObject {
+                            kind: ObjectKind::Occluder,
+                            surface: occ,
+                            position,
+                            depth,
+                            order: objects.len() as u32,
+                        });
+                    }
+                }
+            }
+            if let Some(hl) = self.island.as_ref().and_then(Island::holiday_layer) {
+                if let Some((position, depth)) = sprite_anchor(hl) {
+                    objects.push(SceneObject {
+                        kind: ObjectKind::HolidayProp,
+                        surface: hl.clone(),
+                        position,
+                        depth,
+                        order: objects.len() as u32,
+                    });
+                }
+            }
+            let surface = objects
+                .iter()
+                .fold(ground.clone(), |acc, o| acc.compose_over(&o.surface));
+            return Frame {
+                surface,
+                delay_ticks: wf.delay,
+                sounds: Vec::new(),
+                layers: Some(SceneWorld { ground, objects }),
+            };
+        }
         let mut surface = match &self.island {
             Some(isl) => isl.background().clone(),
             None => Surface::new(self.width, self.height, 0),
@@ -491,6 +694,7 @@ impl Show {
             surface: self.overlay_holiday(surface),
             delay_ticks: wf.delay,
             sounds: Vec::new(),
+            layers: None,
         }
     }
 
@@ -533,6 +737,7 @@ impl Show {
         self.pending_walk = None;
         self.walk_ticks_left = 0;
         self.pending_ads_foreground = None;
+        self.pending_ads_parts.clear();
         self.ads_ticks_left = 0;
         self.pending_ads_sounds.clear();
         self.stage = self.stage_for_current(archive);
@@ -784,6 +989,74 @@ mod tests {
             assert_eq!(f.surface.height, 480);
             assert!(f.delay_ticks > 0);
         }
+    }
+
+    #[test]
+    fn enable_layers_keeps_surface_byte_identical() {
+        let arch = full_archive();
+        let pal = Palette {
+            colors: [[1u8; 3]; 256],
+        };
+        let clock = Clock {
+            yday: 200,
+            hour: 12,
+            month: 6,
+            day: 14,
+        };
+        let mut flat = Show::new(&arch, &pal, 640, 480, Director::new(5, 200), clock, 42);
+        let mut layered = Show::new(&arch, &pal, 640, 480, Director::new(5, 200), clock, 42);
+        layered.enable_layers();
+        let mut saw_layers = false;
+        for i in 0..600 {
+            let a = flat.next_frame(&arch);
+            let b = layered.next_frame(&arch);
+            if a.surface != b.surface {
+                let diffs: Vec<usize> = a
+                    .surface
+                    .pixels
+                    .iter()
+                    .zip(&b.surface.pixels)
+                    .enumerate()
+                    .filter(|(_, (x, y))| x != y)
+                    .map(|(i, _)| i)
+                    .collect();
+                let layered_in_b = b.layers.is_some();
+                let recompose_ok = b
+                    .layers
+                    .as_ref()
+                    .map(|w| {
+                        w.objects
+                            .iter()
+                            .fold(w.ground.clone(), |acc, o| acc.compose_over(&o.surface))
+                            == b.surface
+                    })
+                    .unwrap_or(false);
+                panic!(
+                    "frame {i}: {} px differ; first {}x{}; flat={} layered={}; \
+                     b.layers={} recompose_ok={} nobj={:?}",
+                    diffs.len(),
+                    diffs[0] % 640,
+                    diffs[0] / 640,
+                    a.surface.pixels[diffs[0]],
+                    b.surface.pixels[diffs[0]],
+                    layered_in_b,
+                    recompose_ok,
+                    b.layers.as_ref().map(|w| w.objects.len())
+                );
+            }
+            assert_eq!(a.delay_ticks, b.delay_ticks);
+            if let Some(w) = &b.layers {
+                saw_layers = true;
+                // Recomposing ground ∘ objects in `order` must reproduce the
+                // flat surface exactly — the split drops no pixels.
+                let composed = w
+                    .objects
+                    .iter()
+                    .fold(w.ground.clone(), |acc, o| acc.compose_over(&o.surface));
+                assert_eq!(composed, b.surface, "objects recompose to flat frame");
+            }
+        }
+        assert!(saw_layers, "expected at least one layered scene frame");
     }
 
     #[test]
