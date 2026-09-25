@@ -224,6 +224,51 @@ impl Surface {
         }
     }
 
+    /// Like [`blit`](Self::blit), but also writes `tag` into `tags` for every
+    /// pixel drawn — `tags` must have the same length as `self.pixels`. Lets a
+    /// caller keep per-pixel provenance (e.g. which sprite sheet produced the
+    /// layer's content) for semantic scene splitting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_tagged(
+        &mut self,
+        tags: &mut [u8],
+        tag: u8,
+        src_w: u16,
+        src_h: u16,
+        src: &[u8],
+        x: i32,
+        y: i32,
+        transparent: Option<u8>,
+        flip: bool,
+        clip: Option<Rect>,
+    ) {
+        let sw = src_w as i32;
+        let sh = src_h as i32;
+        let dw = i32::from(self.width);
+        let dh = i32::from(self.height);
+        for sy in 0..sh {
+            for sx in 0..sw {
+                let read_col = if flip { sw - 1 - sx } else { sx };
+                let pixel = src[(sy * sw + read_col) as usize];
+                if Some(pixel) == transparent {
+                    continue;
+                }
+                let (dx, dy) = (x + sx, y + sy);
+                if dx < 0 || dx >= dw || dy < 0 || dy >= dh {
+                    continue;
+                }
+                if let Some(c) = clip {
+                    if !c.contains(dx, dy) {
+                        continue;
+                    }
+                }
+                let idx = (dy * dw + dx) as usize;
+                self.pixels[idx] = pixel;
+                tags[idx] = tag;
+            }
+        }
+    }
+
     /// Copy the non-transparent pixels of the rectangle `(x, y, w, h)` from `src` onto
     /// `self` (used by the TTM `COPY_ZONE_TO_BG` opcode to build the persistent
     /// "saved zones" layer, mirroring `jc_reborn`'s `grCopyZoneToBg`).

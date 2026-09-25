@@ -27,14 +27,48 @@ pub struct AdsFrame {
     /// The composited indexed-color image for this frame.
     pub surface: Surface,
     pub(crate) foreground: Surface,
-    /// The character-plane parts (saved zones + each running thread's layer),
-    /// snapshotted at the same instant as `foreground` — before the timer
-    /// post-processing mutates the thread layers.
-    pub(crate) parts: Vec<Surface>,
+    /// The character-plane parts (saved zones + per-thread sprite-sheet
+    /// partitions), snapshotted at the same instant as `foreground` — before
+    /// the timer post-processing mutates the thread layers.
+    pub(crate) parts: Vec<PartObject>,
     /// How long to display the frame, in engine ticks (1 tick = [`crate::MS_PER_TICK`] = 16 ms).
     pub delay_ticks: u16,
     /// Sound effect ids triggered during this frame.
     pub sounds: Vec<u16>,
+}
+
+/// One semantic piece of a frame's character plane: a sheet-partitioned slice
+/// of a thread layer (or the saved-zones surface) with a script-declared
+/// anchor and a classified kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PartObject {
+    /// This part's opaque pixels on a scene-sized surface.
+    pub(crate) surface: Surface,
+    /// Semantic kind — `Johnny` only when the sprite-sheet name proves it.
+    pub(crate) kind: crate::show::ObjectKind,
+    /// Declared anchor (bottom-centre of the tag's draw-call bounds) in scene
+    /// coordinates; `None` → the caller falls back to the pixel-derived anchor.
+    pub(crate) anchor: Option<(i32, i32)>,
+}
+
+/// `Johnny` iff the sheet name is one of the unambiguous Johnny sprite sets.
+/// `GJ*`/`SJ*`/`SM*` sheets mix gag props and other characters (KINGKO,
+/// BIPLAN, Suzy), so they conservatively stay `Activity` — under-tagging is
+/// safe, over-tagging would split foreign content into the "Johnny" object.
+fn kind_for_sheet(name: Option<&str>) -> crate::show::ObjectKind {
+    use crate::show::ObjectKind;
+    let Some(n) = name.map(|n| n.strip_suffix(".BMP").unwrap_or(n)) else {
+        return ObjectKind::Activity;
+    };
+    let johnny = n.starts_with("JOHN")
+        || n.starts_with("MJ")
+        || n.starts_with("SLEVEJ")
+        || matches!(n, "DRUNKJON" | "JCHANGE" | "STNDLAY" | "SLEEP");
+    if johnny {
+        ObjectKind::Johnny
+    } else {
+        ObjectKind::Activity
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -169,18 +203,63 @@ impl AdsVm {
         self.background.compose_over(&self.background_animation)
     }
 
-    /// The character-plane parts in composite order: saved zones, then each
-    /// running thread's layer. Composing them in sequence over the ground
-    /// reproduces [`compose_frame`] exactly — a spatial compositor uses them as
-    /// separate scene objects instead of the merged [`foreground`].
-    pub(crate) fn foreground_parts(&self) -> Vec<&Surface> {
-        let mut parts = vec![&self.saved_zones];
-        parts.extend(
-            self.threads
+    /// The character-plane parts in composite order: saved zones, then — per
+    /// running thread — one part per sprite-sheet tag plus one for the
+    /// untagged (shape-drawn) remainder. Partitions are disjoint and their
+    /// union is exactly the thread layer, so composing them over the ground
+    /// reproduces [`compose_frame`] exactly.
+    pub(crate) fn foreground_parts(&self) -> Vec<PartObject> {
+        let mut parts = vec![PartObject {
+            surface: self.saved_zones.clone(),
+            kind: crate::show::ObjectKind::Activity,
+            anchor: None,
+        }];
+        for thread in self.threads.iter().filter(|t| t.running != 0) {
+            // Which tags currently own pixels on this layer.
+            let mut present: Vec<u8> = thread
+                .tag_layer
                 .iter()
-                .filter(|t| t.running != 0)
-                .map(|t| &t.layer),
-        );
+                .zip(thread.layer.pixels.iter())
+                .filter(|&(&tag, &p)| tag != 0 && p != crate::surface::TRANSPARENT)
+                .map(|(&tag, _)| tag)
+                .collect();
+            present.sort_unstable();
+            present.dedup();
+            for tag in present {
+                let surface = thread.partition_layer(tag);
+                let anchor = thread
+                    .draw_bounds
+                    .get(&tag)
+                    .map(|&(l, _t, r, b)| ((l + r) / 2, b)); // declared feet-anchor
+                parts.push(PartObject {
+                    surface,
+                    kind: kind_for_sheet(
+                        self.slots
+                            .get(thread.slot_no)
+                            .and_then(|s| s.sheet_names.get(usize::from(tag - 1)))
+                            .and_then(Option::as_deref),
+                    ),
+                    anchor,
+                });
+            }
+            // Untagged pixels (shape draws / uninstrumented writers) — one part.
+            let rest = thread.partition_layer(0);
+            if rest
+                .pixels
+                .iter()
+                .any(|&p| p != crate::surface::TRANSPARENT)
+            {
+                let anchor = thread
+                    .draw_bounds
+                    .get(&0)
+                    .map(|&(l, _t, r, b)| ((l + r) / 2, b));
+                parts.push(PartObject {
+                    surface: rest,
+                    kind: crate::show::ObjectKind::Activity,
+                    anchor,
+                });
+            }
+        }
         parts
     }
 
@@ -244,11 +323,7 @@ impl AdsVm {
         //    (same order as jc_reborn's grUpdateDisplay).
         let foreground = self.foreground();
         let surface = self.compose_frame(&foreground);
-        let parts = self
-            .foreground_parts()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let parts = self.foreground_parts();
 
         // 3. Shortest pending delay across active threads.
         let mut mini = 300u16;
@@ -724,5 +799,157 @@ mod tests {
         let vm = AdsVm::new(&ads(code), 1, &arch, &pal, 2, 2, 999).unwrap();
         // Exactly one of the two candidate scenes was launched.
         assert_eq!(vm.active_threads(), 1);
+    }
+
+    /// A TTM that loads two named sheets and draws one sprite from each.
+    fn two_sheet_ttm() -> Ttm {
+        // TAG 1; LOAD_SCREEN BG.SCR;
+        // SET_BMP_SLOT 0; LOAD_IMAGE JOHNWALK.BMP; DRAW_SPRITE 1 2 frame0 sheet0;
+        // SET_BMP_SLOT 1; LOAD_IMAGE S.BMP;      DRAW_SPRITE 4 1 frame0 sheet1;
+        // UPDATE
+        let mut code = Vec::new();
+        code.extend_from_slice(&op(0x1111));
+        code.extend_from_slice(&1u16.to_le_bytes());
+        code.extend_from_slice(&op(0xF01F));
+        code.extend_from_slice(b"BG.SCR\0\0");
+        code.extend_from_slice(&op(0x1051));
+        code.extend_from_slice(&0u16.to_le_bytes());
+        code.extend_from_slice(&op(0xF02F));
+        code.extend_from_slice(b"JOHNWALK.BMP\0\0");
+        code.extend_from_slice(&op(0xA504));
+        for v in [1u16, 2, 0, 0] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        code.extend_from_slice(&op(0x1051));
+        code.extend_from_slice(&1u16.to_le_bytes());
+        code.extend_from_slice(&op(0xF02F));
+        code.extend_from_slice(b"S.BMP\0");
+        code.extend_from_slice(&op(0xA504));
+        for v in [4u16, 1, 0, 1] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        code.extend_from_slice(&op(0x0FF0));
+        Ttm {
+            version: "1.20".to_string(),
+            num_pages: 1,
+            bytecode: code,
+            tags: Vec::new(),
+        }
+    }
+
+    fn two_sheet_archive() -> Archive {
+        let mut arch = archive();
+        arch.bitmaps.push((
+            "JOHNWALK.BMP".to_string(),
+            Bmp {
+                width: 2,
+                height: 2,
+                images: vec![BmpImage {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![7, 7, 7, 7],
+                }],
+            },
+        ));
+        arch.ttms = vec![("A.TTM".to_string(), two_sheet_ttm())];
+        arch
+    }
+
+    #[test]
+    fn partitions_thread_layer_by_sprite_sheet() {
+        // One thread drawing from two sheets must yield two disjoint objects:
+        // the JOHNWALK sheet classifies as Johnny; S.BMP stays an Activity.
+        let mut code = Vec::new();
+        code.extend_from_slice(&op(0x0001));
+        code.extend_from_slice(&op(0x2005));
+        for v in [1u16, 1, 0, 0] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        code.extend_from_slice(&op(0x1510));
+        code.extend_from_slice(&op(0xFFFF));
+
+        let arch = two_sheet_archive();
+        let pal = palette();
+        let mut vm = AdsVm::new(&ads(code), 1, &arch, &pal, 16, 16, 7).unwrap();
+        let frame = vm.next_frame(&arch).unwrap().expect("a frame");
+
+        let mut parts = frame.parts.iter();
+        let zones = parts.next().unwrap();
+        assert!(zones
+            .surface
+            .pixels
+            .iter()
+            .all(|&p| p == crate::surface::TRANSPARENT));
+
+        let johnny = parts.next().unwrap();
+        assert_eq!(johnny.kind, crate::show::ObjectKind::Johnny);
+        // Declared anchor: bottom-centre of the draw rect (1,2)+2x2 → (2,4).
+        assert_eq!(johnny.anchor, Some((2, 4)));
+
+        let prop = parts.next().unwrap();
+        assert_eq!(prop.kind, crate::show::ObjectKind::Activity);
+        assert_eq!(prop.anchor, Some((5, 3)));
+        assert!(parts.next().is_none());
+
+        // Partitions are disjoint and recompose to the flat foreground exactly.
+        let recompose = frame.parts.iter().fold(
+            crate::surface::Surface::new(16, 16, crate::surface::TRANSPARENT),
+            |acc, p| acc.compose_over(&p.surface),
+        );
+        assert_eq!(recompose.pixels, frame.foreground.pixels);
+        // The Johnny part holds only JOHNWALK pixels (value 7), the prop only 1/2.
+        assert!(johnny.surface.pixels.iter().all(|&p| p != 1 && p != 2));
+        assert!(prop.surface.pixels.iter().all(|&p| p != 7));
+    }
+
+    #[test]
+    fn clear_screen_resets_declared_bounds() {
+        // Draw sprite, CLEAR, draw at a new spot: bounds must track only the
+        // post-clear draw (a stale union would misplace the anchor).
+        let mut code = Vec::new();
+        code.extend_from_slice(&op(0x1111));
+        code.extend_from_slice(&1u16.to_le_bytes());
+        code.extend_from_slice(&op(0xF01F));
+        code.extend_from_slice(b"BG.SCR\0\0");
+        code.extend_from_slice(&op(0x1051));
+        code.extend_from_slice(&0u16.to_le_bytes());
+        code.extend_from_slice(&op(0xF02F));
+        code.extend_from_slice(b"JOHNWALK.BMP\0\0");
+        code.extend_from_slice(&op(0xA504)); // draw at (0,0)
+        for v in [0u16, 0, 0, 0] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        code.extend_from_slice(&op(0xA601)); // CLEAR_SCREEN
+        code.extend_from_slice(&0u16.to_le_bytes());
+        code.extend_from_slice(&op(0xA504)); // draw at (8,9)
+        for v in [8u16, 9, 0, 0] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        code.extend_from_slice(&op(0x0FF0));
+        let ttm = Ttm {
+            version: "1.20".to_string(),
+            num_pages: 1,
+            bytecode: code,
+            tags: Vec::new(),
+        };
+        let mut arch = two_sheet_archive();
+        arch.ttms = vec![("A.TTM".to_string(), ttm)];
+
+        let mut ads_code = Vec::new();
+        ads_code.extend_from_slice(&op(0x0001));
+        ads_code.extend_from_slice(&op(0x2005));
+        for v in [1u16, 1, 0, 0] {
+            ads_code.extend_from_slice(&v.to_le_bytes());
+        }
+        ads_code.extend_from_slice(&op(0x1510));
+        ads_code.extend_from_slice(&op(0xFFFF));
+
+        let pal = palette();
+        let mut vm = AdsVm::new(&ads(ads_code), 1, &arch, &pal, 16, 16, 7).unwrap();
+        let frame = vm.next_frame(&arch).unwrap().expect("a frame");
+        let johnny = &frame.parts[1];
+        // Anchor tracks the post-clear draw only: (8,9)+2x2 → (9,11).
+        assert_eq!(johnny.anchor, Some((9, 11)));
+        assert_eq!(johnny.surface.get(0, 0), Some(crate::surface::TRANSPARENT));
     }
 }

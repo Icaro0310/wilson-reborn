@@ -47,3 +47,35 @@ fn parses_and_decodes_real_data_if_present() {
         archive.ads.len()
     );
 }
+
+/// Diagnostic: which BMPs does each TTM load (F02F LOAD_BMP string args)?
+/// `WILSON_DATA_DIR=... cargo test -p wilson-dgds --test real_data ttm_loads -- --nocapture`
+#[test]
+fn ttm_loads_bmp_names() {
+    let Ok(dir) = std::env::var("WILSON_DATA_DIR") else {
+        return;
+    };
+    let map = std::fs::read(format!("{dir}/RESOURCE.MAP")).unwrap();
+    let rm = ResourceMap::parse(&map).unwrap();
+    let data = std::fs::read(format!("{dir}/{}", rm.data_file_name)).unwrap();
+    let archive = Archive::parse(&map, &data).expect("parse the real archive");
+
+    eprintln!("BMPs:");
+    let mut names: Vec<&str> = archive.bitmaps.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort();
+    for n in names {
+        eprintln!("  {n}");
+    }
+    eprintln!("TTM LOAD_BMP / LOAD_SCR refs:");
+    for (name, ttm) in &archive.ttms {
+        let mut refs = Vec::new();
+        for ins in ttm.instructions().unwrap() {
+            if ins.opcode == 0xF02F || ins.opcode == 0xF01F {
+                if let wilson_dgds::TtmArgs::Str(s) = &ins.args {
+                    refs.push(format!("{:04X}:{}", ins.opcode, s));
+                }
+            }
+        }
+        eprintln!("  {name}: {}", refs.join(", "));
+    }
+}

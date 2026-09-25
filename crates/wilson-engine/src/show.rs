@@ -88,6 +88,9 @@ pub struct SceneObject {
     pub depth: f32,
     /// Original composite order (paint index) — flat parity + tiebreak.
     pub order: u32,
+    /// Whether `position` came from script-declared draw coordinates
+    /// (`true`) or was inferred from the part's opaque pixels (`false`).
+    pub anchor_declared: bool,
 }
 
 /// The separated world of a scene frame: an opaque ground plane plus spatially
@@ -197,7 +200,7 @@ pub struct Show {
     pending_ads_foreground: Option<Surface>,
     /// The per-part character planes snapshotted with `pending_ads_foreground`
     /// (threads keep animating between wave-boundary re-emits — never re-read live).
-    pending_ads_parts: Vec<Surface>,
+    pending_ads_parts: Vec<crate::ads_vm::PartObject>,
     ads_ticks_left: u16,
     pending_ads_sounds: Vec<u16>,
     /// When set, scene frames also carry their un-flattened [`SceneLayers`].
@@ -552,15 +555,27 @@ impl Show {
                 // Iterate the parts snapshotted with this frame (threads keep
                 // animating between wave-boundary re-emits — never re-read live).
                 for part in &self.pending_ads_parts {
-                    if let Some((position, depth)) = sprite_anchor(part) {
-                        objects.push(SceneObject {
-                            kind: ObjectKind::Activity,
-                            surface: part.clone(),
-                            position,
-                            depth,
-                            order: objects.len() as u32,
-                        });
-                    }
+                    // Declared anchor (script draw-call bounds) preferred;
+                    // pixel-derived anchor is the fallback for untracked parts.
+                    let declared = part.anchor.map(|(ax, ay)| {
+                        (
+                            ax as f32 / self.width as f32,
+                            ay as f32 / self.height as f32,
+                        )
+                    });
+                    let (position, declared) = match (declared, sprite_anchor(&part.surface)) {
+                        (Some(a), _) => (a, true),
+                        (None, Some((p, _))) => (p, false),
+                        (None, None) => continue,
+                    };
+                    objects.push(SceneObject {
+                        kind: part.kind,
+                        surface: part.surface.clone(),
+                        position,
+                        depth: position.1,
+                        order: objects.len() as u32,
+                        anchor_declared: declared,
+                    });
                 }
                 // Holiday props composite last → topmost object.
                 if let Some(hl) = self.island.as_ref().and_then(Island::holiday_layer) {
@@ -571,6 +586,7 @@ impl Show {
                             position,
                             depth,
                             order: objects.len() as u32,
+                            anchor_declared: false,
                         });
                     }
                 }
@@ -629,6 +645,8 @@ impl Show {
                     position,
                     depth: position.1,
                     order: 0,
+                    // Anchored on the runtime's own walk-frame coordinates.
+                    anchor_declared: true,
                 });
             }
             // The palm redrawn over Johnny occludes him — a foreground prop
@@ -644,6 +662,7 @@ impl Show {
                             position,
                             depth,
                             order: objects.len() as u32,
+                            anchor_declared: false,
                         });
                     }
                 }
@@ -656,6 +675,7 @@ impl Show {
                         position,
                         depth,
                         order: objects.len() as u32,
+                        anchor_declared: false,
                     });
                 }
             }

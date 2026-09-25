@@ -40,6 +40,9 @@ pub struct TtmSlot {
     pub tags: HashMap<u16, usize>,
     /// Sprite sheets per bitmap slot (each a list of frames).
     pub sprites: Vec<Vec<BmpImage>>,
+    /// Resource name of the sheet currently in each bitmap slot (set by
+    /// `LOAD_BMP`/`0xF02F`) — the script-declared provenance of drawn sprites.
+    pub sheet_names: Vec<Option<String>>,
 }
 
 impl TtmSlot {
@@ -49,6 +52,7 @@ impl TtmSlot {
             instructions: Vec::new(),
             tags: HashMap::new(),
             sprites: vec![Vec::new(); MAX_BMP_SLOTS],
+            sheet_names: vec![None; MAX_BMP_SLOTS],
         }
     }
 
@@ -65,6 +69,7 @@ impl TtmSlot {
             instructions,
             tags,
             sprites: vec![Vec::new(); MAX_BMP_SLOTS],
+            sheet_names: vec![None; MAX_BMP_SLOTS],
         })
     }
 
@@ -107,6 +112,15 @@ pub struct TtmThread {
     pub bg: u8,
     /// Active clip rectangle.
     pub clip: Option<Rect>,
+    /// Per-pixel provenance of `layer`: for each pixel drawn by a sprite blit,
+    /// the bitmap-slot tag (`selected_bmp_slot + 1`); 0 = background/other draw.
+    /// Same length as `layer.pixels`; reset on `CLEAR_SCREEN`.
+    pub tag_layer: Vec<u8>,
+    /// Declared draw bounds per tag — the union of the draw-call rectangles the
+    /// script issued for that tag since the last `CLEAR_SCREEN`
+    /// (`(min_x, min_y, max_x+1, max_y+1)` in scene coordinates). Key 0 covers
+    /// the non-sprite drawing ops (pixels, lines, rects, circles).
+    pub draw_bounds: std::collections::BTreeMap<u8, (i32, i32, i32, i32)>,
 }
 
 impl TtmThread {
@@ -128,7 +142,22 @@ impl TtmThread {
             fg: 0x0F,
             bg: 0x0F,
             clip: None,
+            tag_layer: vec![0; usize::from(width) * usize::from(height)],
+            draw_bounds: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The layer's pixels owned by `tag` (`0` = the untagged remainder) as a
+    /// scene-sized transparent surface — a disjoint partition of `layer`.
+    pub fn partition_layer(&self, tag: u8) -> crate::surface::Surface {
+        let mut out =
+            crate::surface::Surface::new(self.layer.width, self.layer.height, TRANSPARENT);
+        for (i, &p) in self.layer.pixels.iter().enumerate() {
+            if p != TRANSPARENT && self.tag_layer[i] == tag {
+                out.pixels[i] = p;
+            }
+        }
+        out
     }
 }
 
@@ -224,32 +253,44 @@ pub fn run_frame(
                     h: y2 - y1,
                 });
             }
-            0xA002 => thread
-                .layer
-                .put_pixel(signed(a, 0) + dx, signed(a, 1) + dy, thread.fg),
-            0xA0A4 => thread.layer.draw_line(
-                signed(a, 0) + dx,
-                signed(a, 1) + dy,
-                signed(a, 2) + dx,
-                signed(a, 3) + dy,
-                thread.fg,
-            ),
-            0xA104 => thread.layer.fill_rect(
-                signed(a, 0) + dx,
-                signed(a, 1) + dy,
-                unsigned(a, 2),
-                unsigned(a, 3),
-                thread.fg,
-                thread.clip,
-            ),
-            0xA404 => thread.layer.draw_circle(
-                signed(a, 0) + dx,
-                signed(a, 1) + dy,
-                unsigned(a, 2),
-                unsigned(a, 3),
-                thread.fg,
-                thread.bg,
-            ),
+            0xA002 => {
+                let (x, y) = (signed(a, 0) + dx, signed(a, 1) + dy);
+                thread.layer.put_pixel(x, y, thread.fg);
+                grow_bounds(&mut thread.draw_bounds, 0, x, y, x + 1, y + 1);
+            }
+            0xA0A4 => {
+                let (x1, y1) = (signed(a, 0) + dx, signed(a, 1) + dy);
+                let (x2, y2) = (signed(a, 2) + dx, signed(a, 3) + dy);
+                thread.layer.draw_line(x1, y1, x2, y2, thread.fg);
+                grow_bounds(
+                    &mut thread.draw_bounds,
+                    0,
+                    x1.min(x2),
+                    y1.min(y2),
+                    x1.max(x2) + 1,
+                    y1.max(y2) + 1,
+                );
+            }
+            0xA104 => {
+                let (x, y, w, h) = (
+                    signed(a, 0) + dx,
+                    signed(a, 1) + dy,
+                    unsigned(a, 2),
+                    unsigned(a, 3),
+                );
+                thread.layer.fill_rect(x, y, w, h, thread.fg, thread.clip);
+                grow_bounds(&mut thread.draw_bounds, 0, x, y, x + w, y + h);
+            }
+            0xA404 => {
+                let (x, y, w, h) = (
+                    signed(a, 0) + dx,
+                    signed(a, 1) + dy,
+                    unsigned(a, 2),
+                    unsigned(a, 3),
+                );
+                thread.layer.draw_circle(x, y, w, h, thread.fg, thread.bg);
+                grow_bounds(&mut thread.draw_bounds, 0, x, y, x + w, y + h);
+            }
             0xA504 | 0xA524 => {
                 let x = signed(a, 0) + dx;
                 let y = signed(a, 1) + dy;
@@ -257,7 +298,13 @@ pub fn run_frame(
                 let sheet = word(a, 3) as usize;
                 let flip = ins.opcode == 0xA524;
                 if let Some(img) = slot.sprites.get(sheet).and_then(|v| v.get(frame)) {
-                    thread.layer.blit(
+                    // Tag every pixel written with its bitmap-slot id — the
+                    // partitioner can then split this layer into per-sheet
+                    // objects (e.g. Johnny vs. props) without guessing.
+                    let tag = (sheet as u8).saturating_add(1);
+                    thread.layer.blit_tagged(
+                        &mut thread.tag_layer,
+                        tag,
                         img.width,
                         img.height,
                         &img.pixels,
@@ -267,9 +314,21 @@ pub fn run_frame(
                         flip,
                         thread.clip,
                     );
+                    grow_bounds(
+                        &mut thread.draw_bounds,
+                        tag,
+                        x,
+                        y,
+                        x + i32::from(img.width),
+                        y + i32::from(img.height),
+                    );
                 }
             }
-            0xA601 => thread.layer.fill(TRANSPARENT),
+            0xA601 => {
+                thread.layer.fill(TRANSPARENT);
+                thread.tag_layer.fill(0);
+                thread.draw_bounds.clear();
+            }
             // COPY_ZONE_TO_BG: copy a zone of this layer into the persistent "saved
             // zones" layer (composited between background and threads). Used by the
             // giant cargo-ship visitor gag. The `+2` width mirrors jc_reborn's
@@ -306,6 +365,9 @@ pub fn run_frame(
                 let bmp = archive
                     .bmp(name)
                     .ok_or_else(|| EngineError::ResourceNotFound(name.to_string()))?;
+                if let Some(slot_name) = slot.sheet_names.get_mut(thread.selected_bmp_slot) {
+                    *slot_name = Some(name.to_string());
+                }
                 let images: Vec<BmpImage> = bmp
                     .images
                     .iter()
@@ -333,6 +395,27 @@ pub fn run_frame(
             _ => {}
         }
     }
+}
+
+/// Union a draw call's scene rect into `bounds[tag]` — the declared footprint
+/// the script gave that content (independent of what pixels survived).
+fn grow_bounds(
+    bounds: &mut std::collections::BTreeMap<u8, (i32, i32, i32, i32)>,
+    tag: u8,
+    l: i32,
+    t: i32,
+    r: i32,
+    b: i32,
+) {
+    bounds
+        .entry(tag)
+        .and_modify(|e| {
+            e.0 = e.0.min(l);
+            e.1 = e.1.min(t);
+            e.2 = e.2.max(r);
+            e.3 = e.3.max(b);
+        })
+        .or_insert((l, t, r, b));
 }
 
 fn find_previous_tag(slot: &TtmSlot, before: usize) -> usize {

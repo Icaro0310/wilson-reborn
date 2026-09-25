@@ -384,6 +384,7 @@ mod tests {
             position,
             depth: position.1,
             order,
+            anchor_declared: true,
         }
     }
 
