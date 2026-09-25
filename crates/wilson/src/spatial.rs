@@ -343,6 +343,9 @@ mod tests {
         colors[7] = [64, 64, 96]; // wall dither B
         colors[8] = [0, 0, 128]; // sea
         colors[9] = [255, 128, 0]; // island patch (test-only colour)
+        colors[10] = [8, 8, 48]; // night wall dither A
+        colors[11] = [16, 16, 64]; // night wall dither B
+        colors[12] = [0, 0, 56]; // night sea
         Palette { colors }
     }
 
@@ -619,5 +622,102 @@ mod tests {
             g1 <= y0 + 2,
             "near prop over Johnny: green ends {g1}, yellow starts {y0}"
         );
+    }
+
+    // (9) full-viewport coverage at every planet size -------------------------
+    /// The spatial route must write *every* pixel of the square viewport: the
+    /// host window only ever clips the corners outside the circular mask, so
+    /// anything left unwritten would leak the host background inside the
+    /// planet (the "#0000A8 wedges" regression). A sentinel-fill catches it.
+    #[test]
+    fn covers_every_pixel_at_planet_sizes() {
+        let populated = world_with(vec![
+            object(ObjectKind::Johnny, 28, 34, 8, 12, 2, 0),
+            object(ObjectKind::Occluder, 40, 18, 10, 30, 3, 1),
+        ]);
+        let open_sea = SceneWorld {
+            ground: ground((SH as f32 * 0.18) as usize),
+            objects: Vec::new(),
+        };
+        const SENTINEL: u32 = 0x00DE_ADBE;
+        for size in [160usize, 280, 360] {
+            for (label, world) in [("island", &populated), ("open-sea", &open_sea)] {
+                let mut dst = vec![SENTINEL; size * size];
+                render(
+                    world,
+                    &palette(),
+                    &mut dst,
+                    size,
+                    size,
+                    &SpatialCamera::default(),
+                    Filter::Nearest,
+                    false,
+                );
+                let uncovered = dst.iter().filter(|&&p| p == SENTINEL).count();
+                assert_eq!(
+                    uncovered, 0,
+                    "{label} scene at {size}x{size} left {uncovered} pixels unwritten"
+                );
+            }
+        }
+    }
+
+    // (10) night scenes: same full coverage, no white fallback ----------------
+    #[test]
+    fn night_scene_stays_fully_covered() {
+        // Night = dark wall/sea palette indices; structurally the same world.
+        let mut ground = Surface::new(SW as u16, SH as u16, 12);
+        let horizon = (SH as f32 * 0.18) as usize;
+        for y in 0..horizon {
+            for x in 0..SW {
+                ground.pixels[y * SW + x] = if (x + y) % 2 == 0 { 10 } else { 11 };
+            }
+        }
+        let world = SceneWorld {
+            ground,
+            objects: vec![object(ObjectKind::Johnny, 28, 34, 8, 12, 2, 0)],
+        };
+        const SENTINEL: u32 = 0x00DE_ADBE;
+        for size in [160usize, 280, 360] {
+            let mut dst = vec![SENTINEL; size * size];
+            render(
+                &world,
+                &palette(),
+                &mut dst,
+                size,
+                size,
+                &SpatialCamera::default(),
+                Filter::Nearest,
+                false,
+            );
+            assert!(
+                dst.iter().all(|&p| p != SENTINEL),
+                "night scene at {size}x{size} left pixels unwritten"
+            );
+        }
+    }
+
+    // (11) no white/uncoloured fallback anywhere in the frame -----------------
+    #[test]
+    fn no_white_fallback_pixels() {
+        // None of the synthetic palette entries are pure white, so a rendered
+        // white pixel can only come from an uncovered/fallback path.
+        for world in [
+            world_with(vec![object(ObjectKind::Johnny, 28, 34, 8, 12, 2, 0)]),
+            SceneWorld {
+                ground: ground(0), // degenerate: all sea
+                objects: Vec::new(),
+            },
+            SceneWorld {
+                ground: ground(SH), // degenerate: all wall
+                objects: Vec::new(),
+            },
+        ] {
+            let dst = render_world(&world, 280, 280, &SpatialCamera::default());
+            assert!(
+                dst.iter().all(|&p| p & 0x00FF_FFFF != 0x00FF_FFFF),
+                "pure-white pixel found — uncovered fallback"
+            );
+        }
     }
 }
