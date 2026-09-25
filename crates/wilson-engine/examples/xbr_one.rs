@@ -18,7 +18,7 @@ fn main() {
     let (w, h, rgb) = read_ppm(&args[1]);
     // PPM is RGB; the upscaler works on RGBA.
     let mut rgba = Vec::with_capacity(w * h * 4);
-    for px in rgb.chunks_exact(3) {
+    for px in rgb.as_chunks::<3>().0 {
         rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
     }
     if args.get(3).map(String::as_str) == Some("dedither") {
@@ -27,7 +27,7 @@ fn main() {
     let up = xbr2x(&rgba, w, h);
     // Back to RGB for PPM output.
     let mut out_rgb = Vec::with_capacity(w * 2 * h * 2 * 3);
-    for px in up.chunks_exact(4) {
+    for px in up.as_chunks::<4>().0 {
         out_rgb.extend_from_slice(&px[0..3]);
     }
     write_ppm(&args[2], w * 2, h * 2, &out_rgb);

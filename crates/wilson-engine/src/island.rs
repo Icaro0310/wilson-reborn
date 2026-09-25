@@ -19,6 +19,8 @@ use crate::ttm_exec::detect_transparent;
 #[derive(Debug, Clone)]
 pub struct Island {
     background: Surface,
+    wave_base: Surface,
+    wave_layer: Surface,
     holiday: Option<Surface>,
     backgrnd: Vec<BmpImage>,
     low_tide: bool,
@@ -26,6 +28,8 @@ pub struct Island {
     dy: i32,
     wave_c1: i32,
     wave_c2: i32,
+    wave_order: Vec<usize>,
+    wave_sprites: [Option<(usize, i32, i32)>; 4],
 }
 
 impl Island {
@@ -145,8 +149,12 @@ impl Island {
             draw(&mut background, &backgrnd, 2, 150 + dx, 328 + dy, false); // rock
         }
 
+        let wave_base = background.clone();
+        let wave_layer = Surface::new(width, height, TRANSPARENT);
         let mut island = Island {
             background,
+            wave_base,
+            wave_layer,
             holiday: None,
             backgrnd,
             low_tide: state.low_tide,
@@ -154,6 +162,8 @@ impl Island {
             dy,
             wave_c1: 0,
             wave_c2: 0,
+            wave_order: Vec::new(),
+            wave_sprites: [None; 4],
         };
 
         // Prime the shore waves.
@@ -183,6 +193,14 @@ impl Island {
     /// The painted background (opaque).
     pub fn background(&self) -> &Surface {
         &self.background
+    }
+
+    pub(crate) fn static_background(&self) -> &Surface {
+        &self.wave_base
+    }
+
+    pub(crate) fn wave_layer(&self) -> &Surface {
+        &self.wave_layer
     }
 
     /// The holiday prop layer (transparent), if a holiday is active.
@@ -218,73 +236,47 @@ impl Island {
 
     /// Step the looping shore-wave animation (draws the next wave frame).
     pub fn animate_waves(&mut self) {
-        if self.low_tide {
+        let (family, sprite, x, y) = if self.low_tide {
             self.wave_c2 = (self.wave_c2 + 1) % 4;
             let c1 = self.wave_c1 as usize;
             match self.wave_c2 {
-                0 => draw(
-                    &mut self.background,
-                    &self.backgrnd,
-                    39 + c1,
-                    129 + self.dx,
-                    340 + self.dy,
-                    false,
-                ),
-                1 => draw(
-                    &mut self.background,
-                    &self.backgrnd,
-                    30 + c1,
-                    233 + self.dx,
-                    323 + self.dy,
-                    false,
-                ),
-                2 => draw(
-                    &mut self.background,
-                    &self.backgrnd,
-                    33 + c1,
-                    367 + self.dx,
-                    356 + self.dy,
-                    false,
-                ),
-                _ => draw(
-                    &mut self.background,
-                    &self.backgrnd,
-                    36 + c1,
-                    558 + self.dx,
-                    323 + self.dy,
-                    false,
-                ),
+                0 => (3, 39 + c1, 129, 340),
+                1 => (0, 30 + c1, 233, 323),
+                2 => (1, 33 + c1, 367, 356),
+                _ => (2, 36 + c1, 558, 323),
             }
         } else {
             self.wave_c2 = (self.wave_c2 + 1) % 3;
             let c1 = self.wave_c1 as usize;
             match self.wave_c2 {
-                0 => draw(
-                    &mut self.background,
+                0 => (0, 3 + c1, 270, 306),
+                1 => (1, 6 + c1, 364, 319),
+                _ => (2, 9 + c1, 518, 303),
+            }
+        };
+        self.wave_sprites[family] = Some((sprite, x, y));
+        if let Some(position) = self
+            .wave_order
+            .iter()
+            .position(|&current| current == family)
+        {
+            self.wave_order.remove(position);
+        }
+        self.wave_order.push(family);
+        self.wave_layer.fill(TRANSPARENT);
+        for &current in &self.wave_order {
+            if let Some((sprite, x, y)) = self.wave_sprites[current] {
+                draw(
+                    &mut self.wave_layer,
                     &self.backgrnd,
-                    3 + c1,
-                    270 + self.dx,
-                    306 + self.dy,
+                    sprite,
+                    x + self.dx,
+                    y + self.dy,
                     false,
-                ),
-                1 => draw(
-                    &mut self.background,
-                    &self.backgrnd,
-                    6 + c1,
-                    364 + self.dx,
-                    319 + self.dy,
-                    false,
-                ),
-                _ => draw(
-                    &mut self.background,
-                    &self.backgrnd,
-                    9 + c1,
-                    518 + self.dx,
-                    303 + self.dy,
-                    false,
-                ),
+                );
             }
         }
+        self.background = self.wave_base.compose_over(&self.wave_layer);
         if self.wave_c2 == 0 {
             self.wave_c1 = (self.wave_c1 + 1) % 3;
         }
@@ -458,6 +450,43 @@ mod tests {
         for _ in 0..30 {
             isl.animate_waves();
         }
+    }
+
+    #[test]
+    fn wave_phase_replaces_pixels_from_previous_frame() {
+        let mut arch = archive();
+        let sheet = &mut arch
+            .bitmaps
+            .iter_mut()
+            .find(|(name, _)| name == "BACKGRND.BMP")
+            .unwrap()
+            .1;
+        sheet.images[9] = BmpImage {
+            width: 2,
+            height: 2,
+            pixels: vec![20; 4],
+        };
+        sheet.images[10] = BmpImage {
+            width: 1,
+            height: 1,
+            pixels: vec![21],
+        };
+        let pal = Palette {
+            colors: [[0u8; 3]; 256],
+        };
+        let mut rng = Rng::new(9);
+        let mut isl = Island::build(
+            &arch,
+            &state(false, 0, Holiday::None),
+            &pal,
+            640,
+            480,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(isl.background().get(519, 304), Some(20));
+        isl.animate_waves();
+        assert_eq!(isl.background().get(519, 304), Some(3));
     }
 
     #[test]

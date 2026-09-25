@@ -158,7 +158,9 @@ pub fn xbr2x(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     }
     // Precompute Y'UV once per source pixel (each is compared ~80× across the 4 rotations).
     let yuv: Vec<[i32; 3]> = src
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| rgb_to_yuv([p[0], p[1], p[2]]))
         .collect();
     let at = |x: i32, y: i32| -> Px {
@@ -300,7 +302,11 @@ mod tests {
             src.extend_from_slice(&[40, 80, 120, 255]);
         }
         let out = xbr2x(&src, 4, 4);
-        assert!(out.chunks_exact(4).all(|p| p == [40, 80, 120, 255]));
+        assert!(out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [40, 80, 120, 255]));
     }
 
     #[test]
@@ -320,7 +326,10 @@ mod tests {
         }
         let out = xbr2x(&src, w, h);
         assert!(
-            out.chunks_exact(4).all(|p| p[0..3] == a || p[0..3] == b),
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0..3] == a || p[0..3] == b),
             "a straight edge must stay hard (no blended colours)"
         );
     }
@@ -338,7 +347,9 @@ mod tests {
         }
         let out = xbr2x(&src, w, h);
         let has_grey = out
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| (1..=254).contains(&p[0]) && p[0] == p[1] && p[1] == p[2]);
         assert!(
             has_grey,
@@ -355,7 +366,7 @@ mod tests {
             src.extend_from_slice(&[v, 255 - v, v / 2, 200]);
         }
         let out = xbr2x(&src, 5, 5);
-        assert!(out.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(out.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
     }
 
     #[test]
@@ -412,12 +423,14 @@ mod tests {
             40,180,60,32,137,95,10,10,200,17,52,165,40,180,60,93,198,108,255,255,255,255,255,255,
         ];
         let mut rgba = Vec::with_capacity(8 * 8 * 4);
-        for px in GOLDEN_IN.chunks_exact(3) {
+        for px in GOLDEN_IN.as_chunks::<3>().0.iter() {
             rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
         }
         let out = xbr2x(&rgba, 8, 8);
         let out_rgb: Vec<u8> = out
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
         assert_eq!(
@@ -437,7 +450,7 @@ mod tests {
         // Worst case: every pixel a distinct colour (max edges → max work and writes).
         let (w, h) = (640usize, 480usize);
         let mut src = vec![0u8; w * h * 4];
-        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+        for (i, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px[0] = (i % 251) as u8;
             px[1] = ((i / 3) % 253) as u8;
             px[2] = ((i / 7) % 249) as u8;
@@ -463,7 +476,11 @@ mod tests {
             src.extend_from_slice(&[40, 80, 120, 255]);
         }
         let out = dedither(&src, 4, 4);
-        assert!(out.chunks_exact(4).all(|p| p == [40, 80, 120, 255]));
+        assert!(out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [40, 80, 120, 255]));
     }
 
     #[test]
@@ -501,7 +518,10 @@ mod tests {
         }
         let out = dedither(&src, 4, 4);
         assert!(
-            out.chunks_exact(4).all(|p| p == blk || p == wht),
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == blk || *p == wht),
             "a hard edge must stay hard (no grey bleed)"
         );
     }

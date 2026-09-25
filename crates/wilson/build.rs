@@ -158,7 +158,7 @@ fn extract_ne_icon(exe: &[u8]) -> Option<Vec<u8>> {
     let g = group?;
     let want = u16::from_le_bytes([*g.get(4)?, *g.get(5)?]) as usize;
     let mut metas: Vec<(&[u8], &[u8])> = Vec::new();
-    for e in g.get(6..)?.chunks_exact(14).take(want) {
+    for e in g.get(6..)?.as_chunks::<14>().0.iter().take(want) {
         let n_id = u16::from_le_bytes([e[12], e[13]]) & 0x7FFF;
         metas.push((e, icons.get(&n_id)?));
     }

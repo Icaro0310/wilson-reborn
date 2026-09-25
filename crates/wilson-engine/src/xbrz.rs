@@ -312,12 +312,14 @@ mod tests {
         const GOLDEN_IN: &[u8] = include_bytes!("testdata/xbrz_golden_in.bin"); // 8×8×3
         const GOLDEN_OUT: &[u8] = include_bytes!("testdata/xbrz_golden_out.bin"); // 16×16×3
         let mut rgba = Vec::with_capacity(GOLDEN_IN.len() / 3 * 4);
-        for px in GOLDEN_IN.chunks_exact(3) {
+        for px in GOLDEN_IN.as_chunks::<3>().0.iter() {
             rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
         }
         let out = xbrz2x(&rgba, 8, 8);
         let out_rgb: Vec<u8> = out
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
         assert_eq!(
@@ -345,7 +347,11 @@ mod tests {
             src.extend_from_slice(&[40, 80, 120, 255]);
         }
         let out = xbrz2x(&src, 4, 4);
-        assert!(out.chunks_exact(4).all(|p| p == [40, 80, 120, 255]));
+        assert!(out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [40, 80, 120, 255]));
     }
 
     #[test]
@@ -356,7 +362,7 @@ mod tests {
             src.extend_from_slice(&[v, 255 - v, v / 2, 180]);
         }
         let out = xbrz2x(&src, 6, 6);
-        assert!(out.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(out.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
     }
 
     #[test]
@@ -372,7 +378,9 @@ mod tests {
         }
         let out = xbrz2x(&src, w, h);
         let has_grey = out
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| (1..=254).contains(&p[0]) && p[0] == p[1] && p[1] == p[2]);
         assert!(
             has_grey,
@@ -396,7 +404,10 @@ mod tests {
         }
         let out = xbrz2x(&src, w, h);
         assert!(
-            out.chunks_exact(4).all(|p| p[0..3] == a || p[0..3] == b),
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0..3] == a || p[0..3] == b),
             "a straight vertical edge must stay hard"
         );
     }

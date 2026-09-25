@@ -26,6 +26,7 @@ pub const MAX_TTM_SLOTS: usize = 10;
 pub struct AdsFrame {
     /// The composited indexed-color image for this frame.
     pub surface: Surface,
+    pub(crate) foreground: Surface,
     /// How long to display the frame, in engine ticks (1 tick = [`crate::MS_PER_TICK`] = 16 ms).
     pub delay_ticks: u16,
     /// Sound effect ids triggered during this frame.
@@ -56,6 +57,7 @@ pub struct AdsVm {
     palette: Palette,
     transparent_src: Option<u8>,
     background: Surface,
+    background_animation: Surface,
     saved_zones: Surface,
     slots: Vec<TtmSlot>,
     threads: Vec<TtmThread>,
@@ -106,6 +108,7 @@ impl AdsVm {
             palette: palette.clone(),
             transparent_src: detect_transparent(palette),
             background: Surface::new(width, height, 0),
+            background_animation: Surface::new(width, height, TRANSPARENT),
             saved_zones: Surface::new(width, height, TRANSPARENT),
             slots,
             threads,
@@ -144,6 +147,26 @@ impl AdsVm {
     /// island scenery). Island activity scenes draw over this rather than black.
     pub fn set_background(&mut self, background: Surface) {
         self.background = background;
+    }
+
+    pub(crate) fn set_background_animation(&mut self, background_animation: Surface) {
+        self.background_animation = background_animation;
+    }
+
+    pub(crate) fn compose_frame(&self, foreground: &Surface) -> Surface {
+        self.background
+            .compose_over(&self.background_animation)
+            .compose_over(foreground)
+    }
+
+    fn foreground(&self) -> Surface {
+        let mut foreground = self.saved_zones.clone();
+        for thread in &self.threads {
+            if thread.running != 0 {
+                foreground = foreground.compose_over(&thread.layer);
+            }
+        }
+        foreground
     }
 
     /// Run one scheduler iteration; returns the composited frame, or `None` when the
@@ -194,12 +217,8 @@ impl AdsVm {
 
         // 2. Composite background → saved-zones layer → every active thread layer
         //    (same order as jc_reborn's grUpdateDisplay).
-        let mut surface = self.background.compose_over(&self.saved_zones);
-        for t in &self.threads {
-            if t.running != 0 {
-                surface = surface.compose_over(&t.layer);
-            }
-        }
+        let foreground = self.foreground();
+        let surface = self.compose_frame(&foreground);
 
         // 3. Shortest pending delay across active threads.
         let mut mini = 300u16;
@@ -250,6 +269,7 @@ impl AdsVm {
 
         Ok(Some(AdsFrame {
             surface,
+            foreground,
             delay_ticks: mini,
             sounds,
         }))

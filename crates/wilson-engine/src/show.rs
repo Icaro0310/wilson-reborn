@@ -25,6 +25,7 @@ use crate::walk::{WalkFrame, Walker};
 /// (`--intro-secs` / `?intro_secs`). The shipped original has no intro timer (KB10 §10.2); this
 /// is our approximation of "title shown until the first scene loads".
 pub const DEFAULT_INTRO_TICKS: u16 = 187;
+const ISLAND_WAVE_DELAY_TICKS: u16 = 8;
 
 /// The wall-clock inputs the director needs (injected so the runtime is testable).
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +116,12 @@ pub struct Show {
     pending: Option<Frame>,
     /// Set when a new story run was just planned, so `next_frame` can start a transition.
     run_boundary: bool,
+    wave_ticks_left: u16,
+    pending_walk: Option<WalkFrame>,
+    walk_ticks_left: u16,
+    pending_ads_foreground: Option<Surface>,
+    ads_ticks_left: u16,
+    pending_ads_sounds: Vec<u16>,
 }
 
 impl Show {
@@ -166,6 +173,12 @@ impl Show {
             dissolve: None,
             pending: None,
             run_boundary: false,
+            wave_ticks_left: 0,
+            pending_walk: None,
+            walk_ticks_left: 0,
+            pending_ads_foreground: None,
+            ads_ticks_left: 0,
+            pending_ads_sounds: Vec::new(),
         };
         show.plan_new_run(archive);
         show.run_boundary = false; // the very first run is not a transition
@@ -319,42 +332,58 @@ impl Show {
             };
         }
         for _ in 0..20_000 {
+            self.advance_waves_if_due();
+            if self.pending_walk.is_some() {
+                return self.emit_pending_walk();
+            }
+            if self.pending_ads_foreground.is_some() {
+                return self.emit_pending_ads();
+            }
+
+            let walk_step = match &mut self.stage {
+                Stage::Walk(walker) => Some(walker.next_frame()),
+                _ => None,
+            };
+            if let Some(walk_step) = walk_step {
+                match walk_step {
+                    Some(frame) => {
+                        self.pending_walk = Some(frame);
+                        self.walk_ticks_left = frame.delay;
+                        return self.emit_pending_walk();
+                    }
+                    None => {
+                        let scene = self.run.scenes[self.scene_idx];
+                        if !self.try_play(archive, &scene) {
+                            self.go_next_scene(archive);
+                        }
+                        continue;
+                    }
+                }
+            }
+
             enum Action {
-                Walk(WalkFrame),
                 Play(crate::ads_vm::AdsFrame),
-                WalkDone,
                 Done,
             }
             let action = match &mut self.stage {
                 Stage::Idle => Action::Done,
-                Stage::Walk(w) => match w.next_frame() {
-                    Some(wf) => Action::Walk(wf),
-                    None => Action::WalkDone,
-                },
                 Stage::Play(vm) => match vm.next_frame(archive) {
-                    Ok(Some(af)) => Action::Play(af),
+                    Ok(Some(frame)) => Action::Play(frame),
                     _ => Action::Done,
                 },
+                Stage::Walk(_) => continue,
             };
 
             match action {
-                Action::Walk(wf) => return self.frame_from_walk(wf),
-                Action::Play(af) => {
-                    let mut sounds = af.sounds;
+                Action::Play(frame) => {
+                    let mut sounds = frame.sounds;
                     if let Some(s) = self.pending_sound.take() {
                         sounds.insert(0, s);
                     }
-                    return Frame {
-                        surface: self.overlay_holiday(af.surface),
-                        delay_ticks: af.delay_ticks,
-                        sounds,
-                    };
-                }
-                Action::WalkDone => {
-                    let scene = self.run.scenes[self.scene_idx];
-                    if !self.try_play(archive, &scene) {
-                        self.go_next_scene(archive);
-                    }
+                    self.pending_ads_foreground = Some(frame.foreground);
+                    self.ads_ticks_left = frame.delay_ticks.max(1);
+                    self.pending_ads_sounds = sounds;
+                    return self.emit_pending_ads();
                 }
                 Action::Done => self.go_next_scene(archive),
             }
@@ -365,6 +394,73 @@ impl Show {
             surface: Surface::new(self.width, self.height, 0),
             delay_ticks: 8,
             sounds: Vec::new(),
+        }
+    }
+
+    fn advance_waves_if_due(&mut self) {
+        if self.wave_ticks_left != 0 || self.island.is_none() {
+            return;
+        }
+        let animation = {
+            let island = self.island.as_mut().unwrap();
+            island.animate_waves();
+            island.wave_layer().clone()
+        };
+        self.wave_ticks_left = ISLAND_WAVE_DELAY_TICKS;
+        if let Stage::Play(vm) = &mut self.stage {
+            vm.set_background_animation(animation);
+        }
+    }
+
+    fn frame_slice_ticks(&self, remaining: u16) -> u16 {
+        let remaining = remaining.max(1);
+        if self.island.is_some() {
+            remaining.min(self.wave_ticks_left.max(1))
+        } else {
+            remaining
+        }
+    }
+
+    fn consume_wave_ticks(&mut self, ticks: u16) {
+        if self.island.is_some() {
+            self.wave_ticks_left = self.wave_ticks_left.saturating_sub(ticks);
+        }
+    }
+
+    fn emit_pending_walk(&mut self) -> Frame {
+        let walk_frame = self.pending_walk.expect("pending walk frame");
+        let delay = self.frame_slice_ticks(self.walk_ticks_left);
+        let mut frame = self.frame_from_walk(walk_frame);
+        self.walk_ticks_left = self.walk_ticks_left.saturating_sub(delay);
+        self.consume_wave_ticks(delay);
+        if self.walk_ticks_left == 0 {
+            self.pending_walk = None;
+        }
+        frame.delay_ticks = delay;
+        frame
+    }
+
+    fn emit_pending_ads(&mut self) -> Frame {
+        let delay = self.frame_slice_ticks(self.ads_ticks_left);
+        let foreground = self
+            .pending_ads_foreground
+            .as_ref()
+            .expect("pending ADS foreground");
+        let surface = match &self.stage {
+            Stage::Play(vm) => vm.compose_frame(foreground),
+            _ => Surface::new(self.width, self.height, 0),
+        };
+        let surface = self.overlay_holiday(surface);
+        let sounds = std::mem::take(&mut self.pending_ads_sounds);
+        self.ads_ticks_left = self.ads_ticks_left.saturating_sub(delay);
+        self.consume_wave_ticks(delay);
+        if self.ads_ticks_left == 0 {
+            self.pending_ads_foreground = None;
+        }
+        Frame {
+            surface,
+            delay_ticks: delay,
+            sounds,
         }
     }
 
@@ -429,6 +525,16 @@ impl Show {
         } else {
             None
         };
+        self.wave_ticks_left = if self.island.is_some() {
+            ISLAND_WAVE_DELAY_TICKS
+        } else {
+            0
+        };
+        self.pending_walk = None;
+        self.walk_ticks_left = 0;
+        self.pending_ads_foreground = None;
+        self.ads_ticks_left = 0;
+        self.pending_ads_sounds.clear();
         self.stage = self.stage_for_current(archive);
         self.run_boundary = true; // a fresh run ⇒ an opt-in dissolve may start
     }
@@ -477,7 +583,8 @@ impl Show {
         )
         .ok()?;
         if let Some(isl) = &self.island {
-            vm.set_background(isl.background().clone());
+            vm.set_background(isl.static_background().clone());
+            vm.set_background_animation(isl.wave_layer().clone());
             // Offset Johnny's animation to the island's drifted position, exactly like
             // walk frames. Without this, in-place gags (juggling, fishing, sitting…) draw
             // at the un-drifted origin — i.e. off the island, on the water.
@@ -539,6 +646,22 @@ mod tests {
                     width: 2,
                     height: 2,
                     pixels: vec![value; 4],
+                })
+                .collect(),
+        }
+    }
+
+    /// A BMP whose every sprite is a different flat colour — so each wave phase is
+    /// visibly distinct from the previous one (a solid sheet would hide animation).
+    fn distinct_bmp(count: usize) -> Bmp {
+        Bmp {
+            width: 2,
+            height: 2,
+            images: (0..count)
+                .map(|i| BmpImage {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![(i % 250 + 1) as u8; 4],
                 })
                 .collect(),
         }
@@ -996,6 +1119,58 @@ mod tests {
             found_drifted,
             "expected a drifted island scene whose ADS sprite is drawn at the offset"
         );
+    }
+
+    #[test]
+    fn held_poses_recompose_over_advancing_waves() {
+        // Regression for "the sea never moved": the original runs the shore waves on
+        // their own 8-tick background timer (`ttmThread->delay = timer = 8` →
+        // `islandAnimate`), composited *under* whatever pose Johnny is holding. A held
+        // walk/ADS frame must be sliced at the wave boundary and re-emitted over the
+        // new wave phase — the water moves even while Johnny's pose is unchanged.
+        let mut arch = full_archive();
+        arch.bitmaps[0].1 = distinct_bmp(42); // every wave phase looks different
+        let pal = Palette {
+            colors: [[1u8; 3]; 256],
+        };
+        let mut show = Show::new(
+            &arch,
+            &pal,
+            640,
+            480,
+            Director::new(1, 0),
+            Clock {
+                yday: 0,
+                hour: 12,
+                month: 6,
+                day: 14,
+            },
+            9,
+        );
+
+        let mut prev: Option<(Surface, bool)> = None;
+        let mut seen = 0;
+        for _ in 0..60_000 {
+            let f = show.next_frame(&arch);
+            // "Held" = the same foreground pose survived this frame emission, which
+            // only happens when it was sliced at a wave boundary.
+            let held = show.island.is_some()
+                && (show.pending_ads_foreground.is_some() || show.pending_walk.is_some());
+            if let Some((p, was_held)) = &prev {
+                if held && *was_held {
+                    assert_ne!(
+                        p.pixels, f.surface.pixels,
+                        "held pose re-emitted over an unchanged sea (waves not advancing)"
+                    );
+                    seen += 1;
+                    if seen == 5 {
+                        return;
+                    }
+                }
+            }
+            prev = Some((f.surface, held));
+        }
+        panic!("never observed a held pose crossing a wave boundary");
     }
 
     #[test]

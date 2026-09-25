@@ -126,7 +126,7 @@ fn load_data(dir: &Path) -> Result<(Archive, Palette), String> {
 /// Drop the alpha byte from RGBA pixels, yielding packed RGB for PPM output.
 fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0.iter() {
         rgb.extend_from_slice(&px[0..3]);
     }
     rgb

@@ -130,6 +130,141 @@ pub fn scale_rgba_to_argb(
     }
 }
 
+/// `wide-angle` = "little planet" fisheye, framed like a portrait. First the frame
+/// is rendered into the window exactly like the plain path, then a *focus crop* of
+/// the scene — centred on the island band where Johnny and his activities live —
+/// is remapped into a disk inscribed in the window: crop centre → disk centre,
+/// each crop edge → the rim along its own direction. The open sky and sea stay as
+/// a backdrop ring instead of dominating the view; the `r^GAMMA` radial curve
+/// bulges the centre gently. Pixels outside the disk are black — a circular
+/// window region clips them anyway.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_rgba_to_argb_wide(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dst: &mut [u32],
+    dw: usize,
+    dh: usize,
+    mode: ScaleMode,
+    filter: Filter,
+) {
+    if dw == 0 || dh == 0 {
+        dst.fill(0);
+        return;
+    }
+    let mut base = vec![0; dst.len()];
+    scale_rgba_to_argb(src, sw, sh, &mut base, dw, dh, mode, filter);
+
+    // Scene rectangle: the centred aspect-correct rect (same as Fit/Extend);
+    // Stretch fills the whole window.
+    let (tw, th) = match mode {
+        ScaleMode::Stretch => (dw, dh),
+        _ => {
+            if dw * sh <= dh * sw {
+                (dw, (dw * sh / sw).max(1))
+            } else {
+                ((dh * sw / sh).max(1), dh)
+            }
+        }
+    };
+    let (ox, oy) = match mode {
+        ScaleMode::Stretch => (0, 0),
+        _ => ((dw - tw) / 2, (dh - th) / 2),
+    };
+    // Portrait framing: the disk inscribes only a focus crop of the scene, not
+    // the whole 4:3 frame. The island's measured extent in the 640×480 buffer is
+    // x∈[27%,71%], y∈[24%,68%] centred at (49%,46%), so the crop keeps the whole
+    // island — palms to beach — plus a sea/sky margin that survives only as the
+    // rim's backdrop. Johnny is the subject, not the open water.
+    const FOCUS_L: f32 = 0.14;
+    const FOCUS_R: f32 = 0.86;
+    const FOCUS_T: f32 = 0.12;
+    const FOCUS_B: f32 = 0.80;
+    let rcx = ox as f32 + tw as f32 * (FOCUS_L + FOCUS_R) * 0.5;
+    let rcy = oy as f32 + th as f32 * (FOCUS_T + FOCUS_B) * 0.5;
+    let rex = tw as f32 * (FOCUS_R - FOCUS_L) * 0.5;
+    let rey = th as f32 * (FOCUS_B - FOCUS_T) * 0.5;
+    let cx = (dw as f32 - 1.0) * 0.5;
+    let cy = (dh as f32 - 1.0) * 0.5;
+    let disk_r = (dw.min(dh) as f32) * 0.5;
+    const GAMMA: f32 = 1.15; // >1 ⇒ centre bulges, rim compresses (subtle fisheye)
+    for y in 0..dh {
+        for x in 0..dw {
+            let nx = (x as f32 - cx) / disk_r;
+            let ny = (y as f32 - cy) / disk_r;
+            let r = (nx * nx + ny * ny).sqrt();
+            let i = y * dw + x;
+            if r > 1.0 {
+                dst[i] = 0;
+                continue;
+            }
+            // Unit direction from the disk centre and the distance along it to the
+            // scene-rect edge; `r^GAMMA` bends the ray inward (fisheye compression).
+            let (ux, uy) = if r < 1e-6 {
+                (0.0, 0.0)
+            } else {
+                (nx / r, ny / r)
+            };
+            let tx = if ux.abs() < 1e-6 {
+                f32::MAX
+            } else {
+                rex / ux.abs()
+            };
+            let ty = if uy.abs() < 1e-6 {
+                f32::MAX
+            } else {
+                rey / uy.abs()
+            };
+            let t = r.powf(GAMMA) * tx.min(ty);
+            dst[i] = sample_argb(&base, dw, dh, rcx + ux * t, rcy + uy * t, filter);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scale_rgba_to_argb_desktop(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dst: &mut [u32],
+    dw: usize,
+    dh: usize,
+    mode: ScaleMode,
+    filter: Filter,
+    wide_angle: bool,
+) {
+    if wide_angle {
+        scale_rgba_to_argb_wide(src, sw, sh, dst, dw, dh, mode, filter);
+    } else {
+        scale_rgba_to_argb(src, sw, sh, dst, dw, dh, mode, filter);
+    }
+}
+
+fn sample_argb(src: &[u32], sw: usize, sh: usize, fx: f32, fy: f32, filter: Filter) -> u32 {
+    if filter == Filter::Nearest {
+        let x = fx.round().clamp(0.0, (sw - 1) as f32) as usize;
+        let y = fy.round().clamp(0.0, (sh - 1) as f32) as usize;
+        return src[y * sw + x];
+    }
+    let fx = fx.clamp(0.0, (sw - 1) as f32);
+    let fy = fy.clamp(0.0, (sh - 1) as f32);
+    let x0 = fx.floor() as usize;
+    let y0 = fy.floor() as usize;
+    let x1 = (x0 + 1).min(sw - 1);
+    let y1 = (y0 + 1).min(sh - 1);
+    let wx = fx - x0 as f32;
+    let wy = fy - y0 as f32;
+    let channel = |shift: u32| {
+        let top = ((src[y0 * sw + x0] >> shift) & 0xFFu32) as f32 * (1.0 - wx)
+            + ((src[y0 * sw + x1] >> shift) & 0xFFu32) as f32 * wx;
+        let bottom = ((src[y1 * sw + x0] >> shift) & 0xFFu32) as f32 * (1.0 - wx)
+            + ((src[y1 * sw + x1] >> shift) & 0xFFu32) as f32 * wx;
+        (top * (1.0 - wy) + bottom * wy).round() as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
 /// Aspect-correct, centred (like [`scale_rgba_to_argb_fit`]) but with the bars filled by
 /// extending the scene's edge pixels — fills a widescreen window with the sea/sky/horizon
 /// instead of black bars, and without the distortion of `stretch`.
@@ -509,5 +644,79 @@ mod tests {
         let mut dn = [0u32; 8];
         scale_rgba_to_argb_stretch(&src, 2, 1, &mut dn, 8, 1, Filter::Nearest);
         assert!(dn.iter().all(|&p| p == 0 || p == 0x00FF_FFFF));
+    }
+
+    #[test]
+    fn wide_projection_centres_the_focus_crop_and_curves_the_frame() {
+        // 9x9 Extend: focus crop = x∈[1.26,7.74], y∈[1.08,7.2] → centre (4.5,4.14),
+        // so the disk centre samples scene pixel (5,4) — near the island's own
+        // centre (49%,46%), not the geometric scene centre.
+        let mut src = Vec::new();
+        for y in 0..9 {
+            for x in 0..9 {
+                src.extend_from_slice(&[(x * 28) as u8, (y * 28) as u8, 32, 255]);
+            }
+        }
+        let mut ordinary = vec![0u32; 81];
+        let mut wide = vec![0u32; 81];
+        scale_rgba_to_argb(&src, 9, 9, &mut ordinary, 9, 9, ScaleMode::Extend, N);
+        scale_rgba_to_argb_wide(&src, 9, 9, &mut wide, 9, 9, ScaleMode::Extend, N);
+        assert_eq!(wide[4 * 9 + 4], ordinary[4 * 9 + 5]);
+        assert_ne!(wide[4 * 9 + 8], ordinary[4 * 9 + 8]);
+        // The corners sit outside the inscribed disk: black (a circular window
+        // region clips them — this is what makes the planet actually round).
+        for corner in [0usize, 8, 72, 80] {
+            assert_eq!(wide[corner], 0, "corner {corner} must be outside the disk");
+        }
+    }
+
+    #[test]
+    fn wide_projection_bends_the_frame_into_a_disk() {
+        // 33x33 Nearest: the grid is fine enough to see the gentle (GAMMA=1.15)
+        // radial compression in whole pixels. Disk radius = 16.5; the focus crop
+        // is x∈[4.62,28.38], y∈[3.96,26.4] → centre (16.5,15.18), halves
+        // (11.88,11.22).
+        let mut src = Vec::new();
+        for y in 0..33 {
+            for x in 0..33 {
+                src.extend_from_slice(&[(x * 7) as u8, (y * 7) as u8, 32, 255]);
+            }
+        }
+        let mut ordinary = vec![0u32; 33 * 33];
+        let mut wide = vec![0u32; 33 * 33];
+        scale_rgba_to_argb(
+            &src,
+            33,
+            33,
+            &mut ordinary,
+            33,
+            33,
+            ScaleMode::Extend,
+            Filter::Nearest,
+        );
+        scale_rgba_to_argb_wide(
+            &src,
+            33,
+            33,
+            &mut wide,
+            33,
+            33,
+            ScaleMode::Extend,
+            Filter::Nearest,
+        );
+        for i in [16 * 33 + 32usize, 32 * 33 + 16, 16 * 33, 16] {
+            assert_ne!(wide[i], 0, "pixel {i} inside the disk must show the scene");
+        }
+        // Portrait framing: the rim reaches the *crop* edge, not the scene edge —
+        // the right rim shows col ~28 (crop right ≈28.4), never col 32.
+        assert_eq!(wide[16 * 33 + 32], ordinary[15 * 33 + 28]);
+        assert_ne!(wide[16 * 33 + 32], ordinary[15 * 33 + 32]);
+        // …and the top rim shows row ~4 (crop top 3.96), not the sky's row 0.
+        assert_eq!(wide[16], ordinary[4 * 33 + 17]);
+        // The bottom rim shows the sea margin below the beach (crop bottom 26.4).
+        assert_eq!(wide[32 * 33 + 16], ordinary[26 * 33 + 17]);
+        // Gentle fisheye bulge: dst row 26 sits at r=10/16.5≈0.606 →
+        // r^1.15*11.22 ≈ 6.31 → samples src row ~21 below the crop centre.
+        assert_eq!(wide[26 * 33 + 16], ordinary[21 * 33 + 17]);
     }
 }
